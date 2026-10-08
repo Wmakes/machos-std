@@ -1187,50 +1187,51 @@ pub fun error_kind(code: i64) io_error.Kind {
     ret io_error.OTHER;
 }
 
+# MachOS's own words for its errors (sdk/src/abi.mach's err_name)
 pub fun error_message(code: i64) str {
     if (code == ENOENT)       { ret "no such file or directory"; }
-    or (code == EEXIST)       { ret "file exists"; }
+    or (code == EEXIST)       { ret "already exists"; }
     or (code == ENOTDIR)      { ret "not a directory"; }
     or (code == EISDIR)       { ret "is a directory"; }
-    or (code == EBADF)        { ret "bad file descriptor"; }
+    or (code == EBADF)        { ret "bad handle"; }
     or (code == EFAULT)       { ret "bad address"; }
     or (code == ENOMEM)       { ret "out of memory"; }
     or (code == EINVAL)       { ret "invalid argument"; }
     or (code == ENOEXEC)      { ret "not an executable"; }
-    or (code == ECHILD)       { ret "no child processes"; }
+    or (code == ECHILD)       { ret "no such child"; }
     or (code == ENOTEMPTY)    { ret "directory not empty"; }
     or (code == EPIPE)        { ret "broken pipe"; }
-    or (code == ENOSYS)       { ret "function not implemented"; }
-    or (code == EMFILE)       { ret "too many open files"; }
-    or (code == EAGAIN)       { ret "resource temporarily unavailable"; }
+    or (code == ENOSYS)       { ret "no such system call"; }
+    or (code == EMFILE)       { ret "too many open handles"; }
+    or (code == EAGAIN)       { ret "too many processes"; }
     or (code == ESRCH)        { ret "no such process"; }
-    or (code == ENAMETOOLONG) { ret "file name too long"; }
+    or (code == ENAMETOOLONG) { ret "name too long"; }
     or (code == ENOSPC)       { ret "no space left on device"; }
     or (code == EIO)          { ret "input/output error"; }
-    or (code == EXDEV)        { ret "invalid cross-device link"; }
-    or (code == EBUSY)        { ret "device or resource busy"; }
+    or (code == EXDEV)        { ret "cannot move across filesystems"; }
+    or (code == EBUSY)        { ret "busy"; }
     or (code == ENOTTY)       { ret "not a terminal"; }
-    or (code == EINTR)        { ret "interrupted system call"; }
+    or (code == EINTR)        { ret "interrupted"; }
     or (code == EPERM)        { ret "operation not permitted"; }
     or (code == EACCES)       { ret "permission denied"; }
-    or (code == ENOTSUP)      { ret "operation not supported"; }
-    or (code == EROFS)        { ret "read-only file system"; }
-    or (code == ELOOP)        { ret "too many levels of symbolic links"; }
+    or (code == ENOTSUP)      { ret "not supported"; }
+    or (code == EROFS)        { ret "read-only filesystem"; }
+    or (code == ELOOP)        { ret "too many symbolic links"; }
     or (code == ERANGE)       { ret "result out of range"; }
     or (code == ETIMEDOUT)    { ret "timed out"; }
     or (code == ENXIO)        { ret "no such device or address"; }
     or (code == ENODEV)       { ret "no such device"; }
     or (code == E2BIG)        { ret "argument list too long"; }
-    or (code == ENFILE)       { ret "too many open files in system"; }
-    or (code == ESPIPE)       { ret "illegal seek"; }
+    or (code == ENFILE)       { ret "too many open files in the system"; }
+    or (code == ESPIPE)       { ret "cannot seek"; }
     or (code == ETXTBSY)      { ret "text file busy"; }
-    or (code == EADDRINUSE)   { ret "address already in use"; }
-    or (code == ENETUNREACH)  { ret "network is unreachable"; }
+    or (code == EADDRINUSE)   { ret "address in use"; }
+    or (code == ENETUNREACH)  { ret "network unreachable"; }
     or (code == ECONNABORTED) { ret "connection aborted"; }
-    or (code == ECONNRESET)   { ret "connection reset by peer"; }
+    or (code == ECONNRESET)   { ret "connection reset"; }
     or (code == ENOTCONN)     { ret "not connected"; }
     or (code == ECONNREFUSED) { ret "connection refused"; }
-    or (code == EHOSTUNREACH) { ret "no route to host"; }
-    or (code == ECANCELED)    { ret "operation canceled"; }
+    or (code == EHOSTUNREACH) { ret "host unreachable"; }
+    or (code == ECANCELED)    { ret "cancelled"; }
     ret "unknown error";
 }
