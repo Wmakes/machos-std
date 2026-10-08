@@ -25,6 +25,9 @@ $or ($mach.build.os == $mach.os.darwin) {
 $or ($mach.build.os == $mach.os.windows) {
     use std.runtime.windows;
 }
+$or ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+    use std.runtime.machos;
+}
 $or {
     $error("std.runtime needs a linux, darwin or windows target");
 }

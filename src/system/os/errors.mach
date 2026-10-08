@@ -9,6 +9,9 @@ $if ($mach.build.os == $mach.os.linux) {
 $or ($mach.build.os == $mach.os.darwin) {
     use codes: std.system.os.darwin.shared;
 }
+$or ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+    use codes: std.system.os.machos;
+}
 $or ($mach.build.os == $mach.os.windows) {
     use codes: std.system.os.windows.shared;
 }

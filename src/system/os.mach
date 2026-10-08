@@ -17,9 +17,13 @@ use io_error:   std.io.error;
 use io_handle:  std.io.handle;
 use identities: std.system.file_identity;
 use std.system.os.shared;
+use std.system.capability;
 
 $if ($mach.build.os == $mach.os.linux) {
     use impl: std.system.os.linux;
+}
+$or (capability.MACHOS) {
+    use impl: std.system.os.machos;
 }
 $or ($mach.build.os == $mach.os.darwin) {
     use impl: std.system.os.darwin;
@@ -31,7 +35,7 @@ $or {
     $error("std.system.os needs a linux, darwin or windows target");
 }
 
-$if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin || $mach.build.os == $mach.os.windows) {
+$if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin || $mach.build.os == $mach.os.windows || capability.MACHOS) {
     use secret_os: std.system.os.secret;
     use std.system.panic;
 }
