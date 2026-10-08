@@ -39,6 +39,9 @@ $if (capability.HAS_FILES) {
     $or ($mach.build.os == $mach.os.windows) {
         use impl: std.terminal.windows;
     }
+    $or ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+        use impl: std.terminal.machos;
+    }
     $or {
         $error("std.terminal: unsupported target");
     }
