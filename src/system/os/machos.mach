@@ -1355,7 +1355,7 @@ pub fun io_queue_poll(queue: *os_shared.IoQueue, completions: *IoCompletion, cap
     for (remaining > 0) {
         remaining = remaining - 1;
         val raw: usize = completions::usize + remaining * 16;
-        val context: usize = @(raw::*u64)::usize;
+        val context: usize = (@(raw::*u64))::usize;
         var events: u32 = @((raw + 8)::*u32);
         if (context == 0) {
             events = IO_EVENT_WAKE;
