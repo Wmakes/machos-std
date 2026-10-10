@@ -1205,8 +1205,9 @@ pub fun thread_spawn(
         ret tid;
     }
 
-    val setup: *i64 = (child_sp + 80)::*i64;
-    val run:   *i64 = (child_sp + 88)::*i64;
+    # the trampoline's rbp is child_sp - 8: its rbp+80 and rbp+88 are these
+    val setup: *i64 = (child_sp + 72)::*i64;
+    val run:   *i64 = (child_sp + 80)::*i64;
     for (atomic.load(setup) == 0) { thread_wait(setup, 0); }
     @native = 0;
     atomic.store(run, 1);
