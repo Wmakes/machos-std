@@ -24,6 +24,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_starts_with;
+use std.sync.atomic;
 
 $if (!($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos")) {
     $error("std.system.os.machos: requires a freestanding target with platform \"machos\"");
@@ -1035,19 +1036,192 @@ pub fun clock_gettime(clock_id: i32, ts: *timespec) i64 {
     ret syscall2(SYS_CLOCK, clock_id::u32::usize, ts::usize);
 }
 
-# threads: not in the kernel yet
+# threads
+#
+# THREAD_SPAWN starts a thread at a rip with a stack and an FS base; std's
+# block for it sits at the top of its stack and is its FS base, as on linux.
+# the thread begins in _std_machos_thread_trampoline with the start values
+# just above its stack pointer; at its end it frees its own stack, says it
+# can be reclaimed, and leaves with THREAD_EXIT. futex words are 64 bits
+
+val SYS_THREAD_SPAWN: usize = 79;
+val SYS_THREAD_EXIT:  usize = 80;
+val SYS_FUTEX_WAIT:   usize = 81;
+val SYS_FUTEX_WAKE:   usize = 82;
+val SYS_SET_FSBASE:   usize = 83;
+val SYS_GETTID:       usize = 84;
+
+pub val THREAD_STACK_GUARD: usize = 65536;
+
+fun thread_stack_size(reserve: usize) usize { ret reserve + THREAD_STACK_GUARD; }
+
+fun thread_block_reserve() usize {
+    ret ($size_of(os_shared.ThreadBlock)::usize + 15) & ~(15::usize);
+}
+
+fun thread_block_prepare(block: *os_shared.ThreadBlock) {
+    block.self_addr  = block::usize;
+    block.stack_low  = 0;
+    block.stack_high = 0;
+}
+
+# a stack of `reserve` usable bytes above a guard that faults
+fun thread_stack_allocate(reserve: usize, commit: usize, base: *usize) i64 {
+    if (commit != 0)                                { ret ENOTSUP; }
+    if (reserve > ~(0::usize) - THREAD_STACK_GUARD) { ret ENOMEM; }
+    val size: usize = thread_stack_size(reserve);
+    val mapped: ptr = allocate(size);
+    if (mapped == nil) { ret ENOMEM; }
+    val guarded: i64 = protect(mapped, THREAD_STACK_GUARD, 0);
+    if (guarded < 0) {
+        deallocate(mapped, size);
+        ret guarded;
+    }
+    @base = mapped::usize;
+    ret 0;
+}
+
+# where a new thread begins: the values thread_spawn left at its stack
+# pointer (rbp + 8 on, once the prologue ran)
+#[symbol("_std_machos_thread_trampoline")]
+fun thread_trampoline() {
+    var fn_addr:          usize = 0;
+    var arg_addr:         usize = 0;
+    var state_addr:       usize = 0;
+    var reclaimable_addr: usize = 0;
+    var owner_base:       usize = 0;
+    var owner_size:       usize = 0;
+    var stack_base:       usize = 0;
+    var stack_size:       usize = 0;
+    var setup_addr:       usize = 0;
+    var run_addr:         usize = 0;
+    asm x86_64 {
+        mov rax, [rbp+8]
+        mov {fn_addr}, rax
+        mov rax, [rbp+16]
+        mov {arg_addr}, rax
+        mov rax, [rbp+24]
+        mov {state_addr}, rax
+        mov rax, [rbp+32]
+        mov {reclaimable_addr}, rax
+        mov rax, [rbp+40]
+        mov {owner_base}, rax
+        mov rax, [rbp+48]
+        mov {owner_size}, rax
+        mov rax, [rbp+56]
+        mov {stack_base}, rax
+        mov rax, [rbp+64]
+        mov {stack_size}, rax
+        lea rax, [rbp+80]
+        mov {setup_addr}, rax
+        lea rax, [rbp+88]
+        mov {run_addr}, rax
+    }
+
+    val setup: *i64 = setup_addr::*i64;
+    val run:   *i64 = run_addr::*i64;
+    atomic.store(setup, 1);
+    thread_wake(setup);
+    for (atomic.load(run) == 0) { thread_wait(run, 0); }
+
+    var detached: i64 = 0;
+    if (atomic.load(run) > 0) {
+        val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
+        fn_ptr(arg_addr::*u8);
+        val state:    *i64 = state_addr::*i64;
+        var expected: i64  = 0;
+        if (!atomic.cas(state, ?expected, 1)) { detached = 1; }
+    }
+
+    # off its own stack from here: registers and system calls only
+    asm x86_64 {
+        mov r12, {stack_base}
+        mov r13, {stack_size}
+        mov r14, {reclaimable_addr}
+        mov r15, {owner_base}
+        mov rbx, {owner_size}
+        mov r10, {detached}
+
+        mov rdi, r12
+        mov rsi, r13
+        mov rax, 60           # MUNMAP
+        syscall
+
+        test r10, r10
+        jnz 1f
+        mov qword [r14], 1
+        mov rdi, r14
+        mov rsi, 1
+        mov rax, 82           # FUTEX_WAKE
+        syscall
+        jmp 2f
+    1:
+        mov rdi, r15
+        mov rsi, rbx
+        mov rax, 60           # MUNMAP
+        syscall
+    2:
+        mov rax, 80           # THREAD_EXIT
+        syscall
+    }
+    asm x86_64 { hlt }
+}
 
 pub fun thread_spawn(
     f: fun(*u8), arg: *u8, state: *i64, reclaimable: *i64,
     owner: ptr, owner_size: usize, name: *u8,
     stack_reserve: usize, stack_commit: usize, native: *usize,
 ) i64 {
-    ret ENOSYS;
+    var stack_base: usize = 0;
+    val allocation_error: i64 = thread_stack_allocate(stack_reserve, stack_commit, ?stack_base);
+    if (allocation_error < 0) { ret allocation_error; }
+
+    val stack_size: usize = thread_stack_size(stack_reserve);
+    val stack_top:  usize = stack_base + stack_size;
+    val block_addr: usize = stack_top - thread_block_reserve();
+    val child_sp:   usize = block_addr - 104;
+    val block: *os_shared.ThreadBlock = block_addr::*os_shared.ThreadBlock;
+    thread_block_prepare(block);
+    block.stack_low  = stack_base + THREAD_STACK_GUARD;
+    block.stack_high = block_addr;
+    @(child_sp::*usize)        = f::usize;
+    @((child_sp + 8)::*usize)  = arg::usize;
+    @((child_sp + 16)::*usize) = state::usize;
+    @((child_sp + 24)::*usize) = reclaimable::usize;
+    @((child_sp + 32)::*usize) = owner::usize;
+    @((child_sp + 40)::*usize) = owner_size;
+    @((child_sp + 48)::*usize) = stack_base;
+    @((child_sp + 56)::*usize) = stack_size;
+    @((child_sp + 64)::*usize) = name::usize;
+    @((child_sp + 72)::*i64)   = 0;
+    @((child_sp + 80)::*i64)   = 0;
+    @((child_sp + 88)::*i64)   = 0;
+
+    val entry: usize = thread_trampoline::usize;
+    asm x86_64 { mfence }
+    val tid: i64 = syscall5(SYS_THREAD_SPAWN, entry, child_sp, child_sp, block_addr, 0);
+    if (tid < 0) {
+        deallocate(stack_base::ptr, stack_size);
+        ret tid;
+    }
+
+    val setup: *i64 = (child_sp + 80)::*i64;
+    val run:   *i64 = (child_sp + 88)::*i64;
+    for (atomic.load(setup) == 0) { thread_wait(setup, 0); }
+    @native = 0;
+    atomic.store(run, 1);
+    thread_wake(run);
+    ret tid;
 }
 
-pub fun thread_join(native: usize, reclaimable: *i64) i64 { ret ENOSYS; }
-pub fun thread_detach(native: usize) i64 { ret ENOSYS; }
-pub fun thread_current_id() i64 { ret getpid(); }
+pub fun thread_join(native: usize, reclaimable: *i64) i64 {
+    for (atomic.load(reclaimable) == 0) { thread_wait(reclaimable, 0); }
+    ret 0;
+}
+
+pub fun thread_detach(native: usize) i64 { ret 0; }
+
+pub fun thread_current_id() i64 { ret syscall0(SYS_GETTID); }
 
 pub fun thread_current_name(name: *u8, cap: usize) i64 {
     if (cap < 1) { ret EINVAL; }
@@ -1055,15 +1229,51 @@ pub fun thread_current_name(name: *u8, cap: usize) i64 {
     ret 0;
 }
 
-pub fun thread_wait(addr: *i64, expected: i64) i64 { ret ENOSYS; }
-pub fun thread_wait_until(addr: *i64, expected: i64, deadline: *os_shared.Timespec) i64 { ret ENOSYS; }
-pub fun thread_wake(addr: *i64) i64 { ret ENOSYS; }
+# sleep while *addr == expected (spurious wakeups are possible)
+pub fun thread_wait(addr: *i64, expected: i64) i64 {
+    ret syscall3(SYS_FUTEX_WAIT, addr::usize, expected::usize, 0);
+}
 
-# no thread pointer yet: no block, and the token falls back to the thread id
-pub fun thread_block() *os_shared.ThreadBlock { ret nil; }
-pub fun thread_block_enter(block: *os_shared.ThreadBlock) i64 { ret ENOSYS; }
+# the same, until the monotonic clock reaches deadline; 0 when woken (or
+# the value already differed), ETIMEDOUT when the deadline passed
+pub fun thread_wait_until(addr: *i64, expected: i64, deadline: *os_shared.Timespec) i64 {
+    if (deadline == nil || deadline.sec < 0 || deadline.nsec < 0 || deadline.nsec >= 1000000000) { ret EINVAL; }
+    var now: timespec;
+    clock_gettime(CLOCK_MONOTONIC, ?now);
+    val left_ns: i64 = (deadline.sec - now.tv_sec) * 1000000000 + (deadline.nsec - now.tv_nsec);
+    if (left_ns <= 0) { ret ETIMEDOUT; }
+    val ms: i64 = (left_ns + 999999) / 1000000;
+    val result: i64 = syscall3(SYS_FUTEX_WAIT, addr::usize, expected::usize, ms::usize);
+    if (result == EAGAIN || result == EINTR) { ret 0; }
+    ret result;
+}
 
-pub fun stack_bounds(low: *usize, high: *usize) bool { ret false; }
+pub fun thread_wake(addr: *i64) i64 { ret syscall2(SYS_FUTEX_WAKE, addr::usize, 1); }
+
+# the block in the FS base (fs:[0] holds its own address)
+pub fun thread_block() *os_shared.ThreadBlock {
+    var block: usize = 0;
+    asm x86_64 {
+        mov rax, qword fs:[0]
+        mov {block}, rax
+    }
+    ret block::*os_shared.ThreadBlock;
+}
+
+pub fun thread_block_enter(block: *os_shared.ThreadBlock) i64 {
+    thread_block_prepare(block);
+    ret syscall1(SYS_SET_FSBASE, block::usize);
+}
+
+pub fun stack_bounds(low: *usize, high: *usize) bool {
+    val block: *os_shared.ThreadBlock = thread_block();
+    if (block != nil && block.stack_high != 0) {
+        @low  = block.stack_low;
+        @high = block.stack_high;
+        ret true;
+    }
+    ret false;
+}
 
 # io queue: not in the kernel yet
 
