@@ -1410,7 +1410,7 @@ pub val SOCK_CLOEXEC:        i32 = O_CLOEXEC;
 pub val SOL_SOCKET:          i32 = 1;
 pub val SO_UNSUPPORTED:      i32 = -2147483648;
 pub val SO_REUSEADDR:        i32 = 2;
-pub val SO_REUSEPORT:        i32 = 15;
+pub val SO_REUSEPORT:        i32 = SO_UNSUPPORTED; # one listener per port on MachOS
 pub val SO_EXCLUSIVEADDRUSE: i32 = SO_UNSUPPORTED;
 pub val SO_KEEPALIVE:        i32 = 9;
 pub val SO_SNDBUF:           i32 = 7;
@@ -1527,22 +1527,69 @@ pub fun sock_recvfrom(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, ad
 
 pub fun sock_shutdown(fd: usize, how: i32) i64 { ret syscall2(SYS_SHUTDOWN, fd, how::u32::usize); }
 
-# SO_RCVTIMEO (a struct timeval) and SO_BROADCAST (an int); the others are
-# not settable on MachOS
-pub fun sock_setopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: usize) i64 {
-    if (level != SOL_SOCKET || value == nil) { ret ENOTSUP; }
-    if (opt == SO_RCVTIMEO && vallen >= 16) {
-        val sec: i64 = @(value::*i64);
-        val usec: i64 = @((value::usize + 8)::*i64);
-        ret syscall3(SYS_SETSOCKOPT, fd, MACHOS_SO_RCVTIMEO, (sec * 1000 + usec / 1000)::usize);
+# socket options: linux's numbers and value shapes (an int, a struct
+# timeval for SO_RCVTIMEO, a struct linger) onto MachOS's SETSOCKOPT and
+# GETSOCKOPT, which take and give one number
+val SYS_GETSOCKOPT: usize = 90;
+
+# MachOS's number for a (level, option) pair, 0 when it has none
+fun machos_option(level: i32, opt: i32) usize {
+    if (level == SOL_SOCKET) {
+        if (opt == SO_RCVTIMEO)  { ret MACHOS_SO_RCVTIMEO; }
+        if (opt == SO_BROADCAST) { ret MACHOS_SO_BROADCAST; }
+        if (opt == SO_REUSEADDR) { ret 3; }
+        if (opt == SO_KEEPALIVE) { ret 4; }
+        if (opt == SO_SNDBUF)    { ret 6; }
+        if (opt == SO_RCVBUF)    { ret 7; }
+        if (opt == SO_LINGER)    { ret 8; }
     }
-    if (opt == SO_BROADCAST && vallen >= 4) {
-        ret syscall3(SYS_SETSOCKOPT, fd, MACHOS_SO_BROADCAST, (@(value::*i32))::u32::usize);
-    }
-    ret ENOTSUP;
+    if (level == IPPROTO_TCP && opt == TCP_NODELAY) { ret 5; }
+    ret 0;
 }
 
-pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64 { ret ENOTSUP; }
+pub fun sock_setopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: usize) i64 {
+    if (opt == SO_UNSUPPORTED || value == nil) { ret ENOTSUP; }
+    val m: usize = machos_option(level, opt);
+    if (m == 0) { ret ENOTSUP; }
+    var v: usize = 0;
+    if (m == MACHOS_SO_RCVTIMEO) {
+        if (vallen < 16) { ret EINVAL; }
+        val sec: i64 = @(value::*i64);
+        val usec: i64 = @((value::usize + 8)::*i64);
+        v = (sec * 1000 + usec / 1000)::usize;
+    } or (m == 8) {
+        if (vallen < 8) { ret EINVAL; }
+        v = ((@(value::*i32))::u32::usize << 32) | (@((value::usize + 4)::*i32))::u32::usize;
+    } or {
+        if (vallen < 4) { ret EINVAL; }
+        v = (@(value::*i32))::u32::usize;
+    }
+    ret syscall3(SYS_SETSOCKOPT, fd, m, v);
+}
+
+pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64 {
+    if (opt == SO_UNSUPPORTED || value == nil || vallen == nil) { ret ENOTSUP; }
+    val m: usize = machos_option(level, opt);
+    if (m == 0) { ret ENOTSUP; }
+    val got: i64 = syscall2(SYS_GETSOCKOPT, fd, m);
+    if (got < 0) { ret got; }
+    if (m == MACHOS_SO_RCVTIMEO) {
+        if (@vallen < 16) { ret EINVAL; }
+        @(value::*i64) = got / 1000;
+        @((value::usize + 8)::*i64) = (got % 1000) * 1000;
+        @vallen = 16;
+    } or (m == 8) {
+        if (@vallen < 8) { ret EINVAL; }
+        @(value::*i32) = (got::u64 >> 32)::i32;
+        @((value::usize + 4)::*i32) = (got::u64 & 0xFFFFFFFF)::i32;
+        @vallen = 8;
+    } or {
+        if (@vallen < 4) { ret EINVAL; }
+        @(value::*i32) = got::i32;
+        @vallen = 4;
+    }
+    ret 0;
+}
 
 pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64 {
     val r: i64 = syscall2(SYS_GETSOCKNAME, fd, addr::usize);
