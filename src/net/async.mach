@@ -1697,6 +1697,11 @@ $or ($mach.build.os == $mach.os.windows) {
         ret count;
     }
 }
+$or ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+    # MachOS cannot say how much waits on a socket
+    #[testing]
+    fun flood_queued(fd: usize) usize { ret 0; }
+}
 
 # one pending receive and steady sends share a udp socket whose receive buffer
 # a peer keeps overflowing. a wait that returns no receive while datagrams stay
@@ -1948,6 +1953,9 @@ $if ($mach.build.os == $mach.os.linux) {
 }
 $or ($mach.build.os == $mach.os.darwin) {
     use reuse_os: std.system.os.darwin;
+}
+$or ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+    use reuse_os: std.system.os.machos;
 }
 
 #[testing]
