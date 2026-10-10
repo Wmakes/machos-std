@@ -47,15 +47,16 @@ val CPU:      u32 = 512;
 val ALL: u32 = CORE | PAGES | CLOCK | ENTROPY | THREADS | FILES | IO_QUEUE | SOCKETS | PROCESS | CPU;
 
 # MachOS: a freestanding target with `platform = "machos"` in its manifest.
-# std.system.os.machos is its OS layer. threads, the io queue and sockets
-# join as the kernel gains them
+# std.system.os.machos is its OS layer. sockets carry UDP so far (TCP
+# returns ENOSYS until the kernel has it); threads and the io queue join as
+# the kernel gains them
 pub val MACHOS: bool = $mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos";
 
 $if ($mach.build.os == $mach.os.linux) {
     val GROUPS: u32 = ALL;
 }
 $or (MACHOS) {
-    val GROUPS: u32 = CORE | PAGES | CLOCK | ENTROPY | FILES | PROCESS | CPU;
+    val GROUPS: u32 = CORE | PAGES | CLOCK | ENTROPY | FILES | SOCKETS | PROCESS | CPU;
 }
 $or ($mach.build.os == $mach.os.darwin) {
     val GROUPS: u32 = ALL;

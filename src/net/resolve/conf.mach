@@ -12,6 +12,16 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.system.capability;
+
+# where the nameservers are listed: MachOS's kernel keeps the file itself,
+# from DHCP or the address set by hand
+$if (capability.MACHOS) {
+    val RESOLV_CONF: str = "/proc/net/resolv.conf";
+}
+$or {
+    val RESOLV_CONF: str = "/etc/resolv.conf";
+}
 
 pub val DNS_PORT:        u16   = 53;
 pub val MAX_NAMESERVERS: usize = 3;
@@ -232,7 +242,7 @@ pub fun finish(config: *Config) {
 pub fun load(config: *Config) err[io_error.Error] {
     defaults(config);
     var reader: lines.Reader;
-    val opened: err[io_error.Error] = lines.open(?reader, "/etc/resolv.conf");
+    val opened: err[io_error.Error] = lines.open(?reader, RESOLV_CONF);
     if (sel opened.err) {
         finish(config);
         if (opened.err.kind == io_error.NOT_FOUND) { ret err[io_error.Error].ok{}; }

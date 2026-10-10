@@ -67,6 +67,17 @@ val SYS_GETRANDOM: usize = 64;
 val SYS_PREAD:     usize = 65;
 val SYS_PWRITE:    usize = 66;
 val SYS_FDPATH:    usize = 67;
+val SYS_SOCKET:    usize = 68;
+val SYS_BIND:      usize = 69;
+val SYS_CONNECT:   usize = 70;
+val SYS_SENDTO:    usize = 71;
+val SYS_RECVFROM:  usize = 72;
+val SYS_SETSOCKOPT: usize = 73;
+val SYS_GETSOCKNAME: usize = 74;
+
+# MachOS's own socket options (SETSOCKOPT takes the value itself)
+val MACHOS_SO_RCVTIMEO:  usize = 1;
+val MACHOS_SO_BROADCAST: usize = 2;
 
 val MAP_PRIVATE:   usize = 0x02;
 val MAP_ANONYMOUS: usize = 0x20;
@@ -1076,7 +1087,9 @@ pub fun io_queue_wait(queue: *os_shared.IoQueue, timeout_ms: i32) i64 { ret ENOS
 pub fun io_queue_wake(queue: *os_shared.IoQueue) i64 { ret ENOSYS; }
 pub fun io_queue_close(queue: *os_shared.IoQueue) i64 { ret ENOSYS; }
 
-# sockets: not in the kernel yet (the values are linux's, for when they come)
+# sockets: IPv4 datagrams (UDP, and ICMP echo for ping) so far; streams
+# (TCP) return ENOSYS until the kernel has them. the constants are linux's,
+# and so is the sockaddr_in layout MachOS takes
 
 pub val AF_INET:             i32 = 2;
 pub val AF_INET6:            i32 = 10;
@@ -1094,6 +1107,7 @@ pub val SO_SNDBUF:           i32 = 7;
 pub val SO_RCVBUF:           i32 = 8;
 pub val SO_LINGER:           i32 = 13;
 pub val SO_RCVTIMEO:         i32 = 20;
+pub val SO_BROADCAST:        i32 = 6;
 pub val IPPROTO_IP:          i32 = 0;
 pub val IPPROTO_TCP:         i32 = 6;
 pub val IPPROTO_IPV6:        i32 = 41;
@@ -1126,32 +1140,92 @@ pub val SCM_PIDFD:              i32   = 4;
 pub val SCM_MAX_FD:             usize = 253;
 pub val LOCAL_CONTROL_CAPACITY: usize = 1088;
 
-pub fun sock_send(fd: usize, buf: *u8, len: usize) i64 { ret ENOSYS; }
-pub fun sock_recv(fd: usize, buf: *u8, len: usize) i64 { ret ENOSYS; }
+pub fun sock_send(fd: usize, buf: *u8, len: usize) i64 { ret syscall5(SYS_SENDTO, fd, buf::usize, len, 0, 0); }
+pub fun sock_recv(fd: usize, buf: *u8, len: usize) i64 { ret syscall5(SYS_RECVFROM, fd, buf::usize, len, 0, 0); }
 pub fun sock_peek_readable(fd: usize) i64 { ret ENOSYS; }
-pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64 { ret ENOSYS; }
+pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64 {
+    var total: i64 = 0;
+    var i: usize = 0;
+    for (i < count) {
+        val v: *IoVector = (vectors::usize + i * $size_of(IoVector)::usize)::*IoVector;
+        val r: i64 = sock_send(fd, v.data, v.length);
+        if (r < 0) {
+            if (total > 0) { ret total; }
+            ret r;
+        }
+        total = total + r;
+        i = i + 1;
+    }
+    ret total;
+}
 pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64 { ret ENOSYS; }
 pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: *u32, control: *u8, control_length: *usize, flags: *i32) i64 { ret ENOSYS; }
 pub fun sock_recv_close_rights(fd: usize, buffer: *u8, length: usize, address: *u8, address_length: *u32, control: *u8, capacity: usize) i64 { ret ENOSYS; }
 pub fun local_stream_recv(fd: usize, buffer: *u8, length: usize) i64 { ret ENOSYS; }
-pub fun sock_connect_status(fd: usize) i64 { ret ENOSYS; }
+pub fun sock_connect_status(fd: usize) i64 { ret 0; }
 pub fun sock_close(fd: usize) i64 { ret close(fd::isize::i32); }
-pub fun sock_create(domain: i32, typ: i32, protocol: i32, out: *usize) i64 { ret ENOSYS; }
-pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: bool, non_inheritable: bool, out: *usize) i64 { ret ENOSYS; }
-pub fun sock_bind(fd: usize, addr: *u8, addrlen: usize) i64 { ret ENOSYS; }
+
+pub fun sock_create(domain: i32, typ: i32, protocol: i32, out: *usize) i64 {
+    ret sock_create_flags(domain, typ, protocol, false, false, out);
+}
+
+pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: bool, non_inheritable: bool, out: *usize) i64 {
+    if (out == nil) { ret EINVAL; }
+    @out = (-1)::isize::usize;
+    val raw: i64 = syscall3(SYS_SOCKET, domain::u32::usize, typ::u32::usize, protocol::u32::usize);
+    if (raw < 0) { ret raw; }
+    @out = raw::usize;
+    ret 0;
+}
+
+pub fun sock_bind(fd: usize, addr: *u8, addrlen: usize) i64 { ret syscall3(SYS_BIND, fd, addr::usize, addrlen); }
 pub fun sock_listen(fd: usize, backlog: i32) i64 { ret ENOSYS; }
 pub fun sock_accept(fd: usize, addr: *u8, addrlen: *u32, out: *usize) i64 { ret ENOSYS; }
 pub fun sock_accept_flags(fd: usize, addr: *u8, addrlen: *u32, nonblocking: bool, non_inheritable: bool, out: *usize) i64 { ret ENOSYS; }
-pub fun sock_connect(fd: usize, addr: *u8, addrlen: usize) i64 { ret ENOSYS; }
-pub fun sock_sendto(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: usize) i64 { ret ENOSYS; }
-pub fun sock_recvfrom(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: *u32) i64 { ret ENOSYS; }
+pub fun sock_connect(fd: usize, addr: *u8, addrlen: usize) i64 { ret syscall3(SYS_CONNECT, fd, addr::usize, addrlen); }
+
+pub fun sock_sendto(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: usize) i64 {
+    ret syscall5(SYS_SENDTO, fd, buf::usize, len, addr::usize, addrlen);
+}
+
+pub fun sock_recvfrom(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: *u32) i64 {
+    ret syscall5(SYS_RECVFROM, fd, buf::usize, len, addr::usize, addrlen::usize);
+}
+
 pub fun sock_shutdown(fd: usize, how: i32) i64 { ret ENOSYS; }
-pub fun sock_setopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: usize) i64 { ret ENOSYS; }
-pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64 { ret ENOSYS; }
-pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64 { ret ENOSYS; }
-pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64 { ret ENOSYS; }
-pub fun sock_inheritable(fd: usize, out: *bool) i64 { ret ENOSYS; }
-pub fun sock_set_rcvtimeo(fd: usize, ms: u64) i64 { ret ENOSYS; }
+
+# SO_RCVTIMEO (a struct timeval) and SO_BROADCAST (an int); the others are
+# not settable on MachOS
+pub fun sock_setopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: usize) i64 {
+    if (level != SOL_SOCKET || value == nil) { ret ENOTSUP; }
+    if (opt == SO_RCVTIMEO && vallen >= 16) {
+        val sec: i64 = @(value::*i64);
+        val usec: i64 = @((value::usize + 8)::*i64);
+        ret syscall3(SYS_SETSOCKOPT, fd, MACHOS_SO_RCVTIMEO, (sec * 1000 + usec / 1000)::usize);
+    }
+    if (opt == SO_BROADCAST && vallen >= 4) {
+        ret syscall3(SYS_SETSOCKOPT, fd, MACHOS_SO_BROADCAST, (@(value::*i32))::u32::usize);
+    }
+    ret ENOTSUP;
+}
+
+pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64 { ret ENOTSUP; }
+
+pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64 {
+    val r: i64 = syscall2(SYS_GETSOCKNAME, fd, addr::usize);
+    if (r >= 0 && addrlen != nil) { @addrlen = 16; }
+    ret r;
+}
+
+pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64 { ret ENOTSUP; }
+
+# no socket handle is passed on across exec here
+pub fun sock_inheritable(fd: usize, out: *bool) i64 {
+    @out = false;
+    ret 0;
+}
+
+pub fun sock_set_rcvtimeo(fd: usize, ms: u64) i64 { ret syscall3(SYS_SETSOCKOPT, fd, MACHOS_SO_RCVTIMEO, ms::usize); }
 
 # dns
 pub val DNS_HOSTS_PATH: str = "/etc/hosts";
