@@ -1,0 +1,27 @@
+# the MachOS part of the readiness backend for internet sockets
+# backend for std.net.async, signatures may change in a minor release (README, API surface)
+# std.net.async.unix holds the backend. MachOS's datagrams carry no control
+# messages, so no packet says where it was sent to or on which interface
+
+$if (!($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos")) {
+    $error("std.net.async.machos: requires the machos platform");
+}
+
+use std.net.async.types;
+use std.types.bool.false;
+use std.types.size.usize;
+
+pub val MSG_TRUNC: i32 = 0x20;
+
+# nothing to ask for
+pub fun configure_datagram(resource: usize, family: i32) i64 { ret 0; }
+
+pub fun packet_metadata(packet: *types.Packet, control: *u8, length: usize) {
+    packet.has_local_destination = false;
+    packet.interface_index       = 0;
+}
+
+pub fun packet_send_metadata(packet: *types.Packet, control: *u8, length: *usize) i64 {
+    @length = 0;
+    ret 0;
+}

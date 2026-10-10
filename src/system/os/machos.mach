@@ -268,6 +268,7 @@ pub val ENOTCONN:     i64 = -41;
 pub val ECONNREFUSED: i64 = -42;
 pub val EHOSTUNREACH: i64 = -43;
 pub val ECANCELED:    i64 = -44;
+pub val EINPROGRESS:  i64 = -45;
 
 pub val EINTR_MAX_RETRIES: usize = 8;
 
@@ -1276,7 +1277,18 @@ pub fun stack_bounds(low: *usize, high: *usize) bool {
     ret false;
 }
 
-# io queue: not in the kernel yet
+# io queue: MachOS's readiness queue (QUEUE_*), one-shot like epoll with
+# EPOLLONESHOT; QUEUE_WAKE stands in for an eventfd. a wait writes 16-byte
+# records (context, events), widened here to IoCompletion in place
+
+val SYS_QUEUE_CREATE: usize = 85;
+val SYS_QUEUE_CTL:    usize = 86;
+val SYS_QUEUE_WAIT:   usize = 87;
+val SYS_QUEUE_WAKE:   usize = 88;
+val SYS_SOCK_STATUS:  usize = 89;
+val QUEUE_ADD: usize = 1;
+val QUEUE_DEL: usize = 2;
+val QUEUE_MOD: usize = 3;
 
 pub val IO_EVENT_READ:   u32 = 0x01;
 pub val IO_EVENT_WRITE:  u32 = 0x02;
@@ -1292,15 +1304,99 @@ pub rec IoCompletion {
     flags:   u64;
 }
 
-pub fun io_queue_create(queue: *os_shared.IoQueue) i64 { ret ENOSYS; }
-pub fun io_queue_watch(queue: *os_shared.IoQueue, resource: usize, context: usize, events: u32) i64 { ret ENOSYS; }
-pub fun io_queue_rearm(queue: *os_shared.IoQueue, resource: usize, context: usize, events: u32) i64 { ret ENOSYS; }
-pub fun duplicate_to(from: usize, to: usize) i64 { ret syscall2(33, from, to); }
-pub fun io_queue_unwatch(queue: *os_shared.IoQueue, resource: usize) i64 { ret ENOSYS; }
-pub fun io_queue_poll(queue: *os_shared.IoQueue, completions: *IoCompletion, capacity: usize, timeout_ms: i32) i64 { ret ENOSYS; }
-pub fun io_queue_wait(queue: *os_shared.IoQueue, timeout_ms: i32) i64 { ret ENOSYS; }
-pub fun io_queue_wake(queue: *os_shared.IoQueue) i64 { ret ENOSYS; }
-pub fun io_queue_close(queue: *os_shared.IoQueue) i64 { ret ENOSYS; }
+pub fun io_queue_create(queue: *os_shared.IoQueue) i64 {
+    if (queue == nil) { ret EINVAL; }
+    queue.handle       = (-1)::isize::usize;
+    queue.wake         = (-1)::isize::usize;
+    queue.wake_pending = 0;
+    queue.wakes_posted = 0;
+    val q: i64 = syscall0(SYS_QUEUE_CREATE);
+    if (q < 0) { ret q; }
+    queue.handle = q::usize;
+    queue.wake   = q::usize;
+    ret 0;
+}
+
+fun io_queue_control(queue: *os_shared.IoQueue, op: usize, resource: usize, context: usize, events: u32) i64 {
+    if (queue == nil || context == 0 || (events & (IO_EVENT_READ | IO_EVENT_WRITE)) == 0) { ret EINVAL; }
+    ret syscall5(SYS_QUEUE_CTL, queue.handle, op, resource, (events & (IO_EVENT_READ | IO_EVENT_WRITE))::usize, context);
+}
+
+pub fun io_queue_watch(queue: *os_shared.IoQueue, resource: usize, context: usize, events: u32) i64 {
+    ret io_queue_control(queue, QUEUE_ADD, resource, context, events);
+}
+
+pub fun io_queue_rearm(queue: *os_shared.IoQueue, resource: usize, context: usize, events: u32) i64 {
+    ret io_queue_control(queue, QUEUE_MOD, resource, context, events);
+}
+
+pub fun duplicate_to(from: usize, to: usize) i64 {
+    val r: i64 = syscall2(33, from, to);
+    if (r < 0) { ret r; }
+    ret 0;
+}
+
+pub fun io_queue_unwatch(queue: *os_shared.IoQueue, resource: usize) i64 {
+    if (queue == nil) { ret EINVAL; }
+    val removed: i64 = syscall5(SYS_QUEUE_CTL, queue.handle, QUEUE_DEL, resource, 0, 0);
+    if (removed == ENOENT || removed == EBADF) { ret 0; }
+    ret removed;
+}
+
+# the kernel's 16-byte records are widened to IoCompletion's 32 bytes from
+# the last one back, so none is overwritten before it is read
+pub fun io_queue_poll(queue: *os_shared.IoQueue, completions: *IoCompletion, capacity: usize, timeout_ms: i32) i64 {
+    if (queue == nil || completions == nil || capacity == 0 || capacity > 1024) { ret EINVAL; }
+    var ms: usize = 0xFFFFFFFF;
+    if (timeout_ms >= 0) { ms = timeout_ms::isize::usize; }
+    val result: i64 = syscall4(SYS_QUEUE_WAIT, queue.handle, completions::usize, capacity, ms);
+    if (result <= 0) { ret result; }
+    var remaining: usize = result::usize;
+    for (remaining > 0) {
+        remaining = remaining - 1;
+        val raw: usize = completions::usize + remaining * 16;
+        val context: usize = @(raw::*u64)::usize;
+        var events: u32 = @((raw + 8)::*u32);
+        if (context == 0) {
+            events = IO_EVENT_WAKE;
+            # taken before the caller looks for work, so a later request posts again
+            os_shared.io_wake_harvested(queue);
+        }
+        completions[remaining].context = context;
+        completions[remaining].events  = events;
+        completions[remaining].status  = 0;
+        completions[remaining].flags   = events::u64;
+        completions[remaining].source  = os_shared.io_context_source(context);
+    }
+    ret result;
+}
+
+pub fun io_queue_wait(queue: *os_shared.IoQueue, timeout_ms: i32) i64 {
+    var completion: IoCompletion;
+    ret io_queue_poll(queue, ?completion, 1, timeout_ms);
+}
+
+pub fun io_queue_wake(queue: *os_shared.IoQueue) i64 {
+    if (queue == nil)                     { ret EINVAL; }
+    if (queue.wake == (-1)::isize::usize) { ret EBADF; }
+    if (!os_shared.io_wake_claim(queue))  { ret 0; }
+    val result: i64 = syscall1(SYS_QUEUE_WAKE, queue.wake);
+    if (result < 0) {
+        os_shared.io_wake_harvested(queue);
+        ret result;
+    }
+    os_shared.io_wake_posted(queue);
+    ret 0;
+}
+
+pub fun io_queue_close(queue: *os_shared.IoQueue) i64 {
+    if (queue == nil) { ret EINVAL; }
+    var result: i64 = 0;
+    if (queue.handle != (-1)::isize::usize) { result = close(queue.handle::isize::i32); }
+    queue.handle = (-1)::isize::usize;
+    queue.wake   = (-1)::isize::usize;
+    ret result;
+}
 
 # sockets: IPv4 streams (TCP) and datagrams (UDP, and ICMP echo for ping).
 # the constants are linux's, and so is the sockaddr_in layout MachOS takes
@@ -1309,7 +1405,7 @@ pub val AF_INET:             i32 = 2;
 pub val AF_INET6:            i32 = 10;
 pub val SOCK_STREAM:         i32 = 1;
 pub val SOCK_DGRAM:          i32 = 2;
-pub val SOCK_NONBLOCK:       i32 = O_NONBLOCK;
+pub val SOCK_NONBLOCK:       i32 = 0x800;
 pub val SOCK_CLOEXEC:        i32 = O_CLOEXEC;
 pub val SOL_SOCKET:          i32 = 1;
 pub val SO_UNSUPPORTED:      i32 = -2147483648;
@@ -1356,7 +1452,7 @@ pub val LOCAL_CONTROL_CAPACITY: usize = 1088;
 
 pub fun sock_send(fd: usize, buf: *u8, len: usize) i64 { ret syscall5(SYS_SENDTO, fd, buf::usize, len, 0, 0); }
 pub fun sock_recv(fd: usize, buf: *u8, len: usize) i64 { ret syscall5(SYS_RECVFROM, fd, buf::usize, len, 0, 0); }
-pub fun sock_peek_readable(fd: usize) i64 { ret ENOSYS; }
+pub fun sock_peek_readable(fd: usize) i64 { ret syscall2(SYS_SOCK_STATUS, fd, 1); }
 pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64 {
     var total: i64 = 0;
     var i: usize = 0;
@@ -1372,11 +1468,21 @@ pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64 {
     }
     ret total;
 }
-pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64 { ret ENOSYS; }
-pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: *u32, control: *u8, control_length: *usize, flags: *i32) i64 { ret ENOSYS; }
+# one datagram from the first vector (MachOS has no control messages)
+pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64 {
+    if (vector_count != 1 || control_length != 0) { ret ENOTSUP; }
+    ret sock_sendto(fd, vectors.data, vectors.length, 0, address, address_length::usize);
+}
+
+pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: *u32, control: *u8, control_length: *usize, flags: *i32) i64 {
+    if (vector_count != 1) { ret ENOTSUP; }
+    if (control_length != nil) { @control_length = 0; }
+    if (flags != nil) { @flags = 0; }
+    ret sock_recvfrom(fd, vectors.data, vectors.length, 0, address, address_length);
+}
 pub fun sock_recv_close_rights(fd: usize, buffer: *u8, length: usize, address: *u8, address_length: *u32, control: *u8, capacity: usize) i64 { ret ENOSYS; }
 pub fun local_stream_recv(fd: usize, buffer: *u8, length: usize) i64 { ret ENOSYS; }
-pub fun sock_connect_status(fd: usize) i64 { ret 0; }
+pub fun sock_connect_status(fd: usize) i64 { ret syscall2(SYS_SOCK_STATUS, fd, 0); }
 pub fun sock_close(fd: usize) i64 { ret close(fd::isize::i32); }
 
 pub fun sock_create(domain: i32, typ: i32, protocol: i32, out: *usize) i64 {
@@ -1386,7 +1492,9 @@ pub fun sock_create(domain: i32, typ: i32, protocol: i32, out: *usize) i64 {
 pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: bool, non_inheritable: bool, out: *usize) i64 {
     if (out == nil) { ret EINVAL; }
     @out = (-1)::isize::usize;
-    val raw: i64 = syscall3(SYS_SOCKET, domain::u32::usize, typ::u32::usize, protocol::u32::usize);
+    var native_type: i32 = typ;
+    if (nonblocking) { native_type = native_type | SOCK_NONBLOCK; }
+    val raw: i64 = syscall3(SYS_SOCKET, domain::u32::usize, native_type::u32::usize, protocol::u32::usize);
     if (raw < 0) { ret raw; }
     @out = raw::usize;
     ret 0;
@@ -1536,5 +1644,6 @@ pub fun error_message(code: i64) str {
     or (code == ECONNREFUSED) { ret "connection refused"; }
     or (code == EHOSTUNREACH) { ret "host unreachable"; }
     or (code == ECANCELED)    { ret "cancelled"; }
+    or (code == EINPROGRESS)  { ret "in progress"; }
     ret "unknown error";
 }

@@ -13,6 +13,10 @@ $or ($mach.build.os == $mach.os.darwin) {
     use platform: std.net.async.darwin;
     use sys:      std.system.os.darwin;
 }
+$or ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+    use platform: std.net.async.machos;
+    use sys:      std.system.os.machos;
+}
 $or {
     $error("std.net.async.unix: requires linux or darwin target");
 }
