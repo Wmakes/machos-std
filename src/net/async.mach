@@ -1044,7 +1044,7 @@ test async_network__ownership_query_includes_driver_backend_and_runtime {
         !ok_err(io_runtime.make(?runtime, ?pa, 2))) { ret 1; }
     var partial: impl.Backend;
     partial.queue = ?runtime.queue;
-    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin || ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos")) {
         partial.operations.capacity = 2;
         partial.map_capacity        = 4;
     }
@@ -1065,7 +1065,7 @@ test async_network__ownership_query_includes_driver_backend_and_runtime {
         aliases(?driver, ?external[0], 8) ||
         aliases(?driver, (~(0::usize))::*u8, 1) ||
         !aliases(?driver, (~(0::usize) - 1)::*u8, 3)) { ret 4; }
-    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin || ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos")) {
         if (!aliases(?driver, driver.backend.resources.chunks[0]::*u8, 1) ||
             !aliases(?driver, driver.backend.resource_map::*u8, 1) ||
             !aliases(?driver, driver.backend.native::*u8, 1) ||
