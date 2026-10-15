@@ -50,6 +50,7 @@ fwd std.math;
 fwd std.math.float;
 fwd std.math.bits;
 fwd std.math.bignum;
+fwd std.math.bignum.nat;
 fwd std.math.ieee;
 fwd std.math.mat4;
 fwd std.math.quat;
