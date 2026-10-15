@@ -172,7 +172,7 @@ pub fun check[T]() {
         $or ($is_record(f.type))  { check[f.type](); }
         $or (f.type == i8 || f.type == i16 || f.type == i32 || f.type == i64
             || f.type == u8 || f.type == u16 || f.type == u32 || f.type == u64
-            || f.type == f32 || f.type == f64) {}
+            || f.type == f16 || f.type == f32 || f.type == f64) {}
         $or { $error("std.derive: field type is neither a scalar numeric nor a nested record -- an array, a vector, or a ^ secret needs caller-chosen semantics. a ^ field lands here because nothing strips ^: not type comparison, and since briar-systems/mach#2692 not the shape predicates either (briar-systems/mach#2694)"); }
     }
 }
@@ -196,7 +196,7 @@ pub fun eq[T](a: *T, b: *T) bool {
         }
         $or (f.type == i8 || f.type == i16 || f.type == i32 || f.type == i64
             || f.type == u8 || f.type == u16 || f.type == u32 || f.type == u64
-            || f.type == f32 || f.type == f64) {
+            || f.type == f16 || f.type == f32 || f.type == f64) {
             if (a.[f] != b.[f]) { ret false; }
         }
         $or {}
@@ -240,6 +240,7 @@ fun fold_fields[T](h0: u64, v: *T) u64 {
         }
         $or (f.type == f64) { h = fold(h, (v.[f] + 0.0):~u64); }
         $or (f.type == f32) { h = fold(h, ((v.[f])::f64 + 0.0):~u64); }
+        $or (f.type == f16) { h = fold(h, ((v.[f])::f64 + 0.0):~u64); }
         $or                 {}
     }
     ret h;
@@ -268,7 +269,7 @@ pub fun clone[T](dst: *T, src: *T) {
         $if ($is_record(f.type)) { clone[f.type](?dst.[f], ?src.[f]); }
         $or (f.type == i8 || f.type == i16 || f.type == i32 || f.type == i64
             || f.type == u8 || f.type == u16 || f.type == u32 || f.type == u64
-            || f.type == f32 || f.type == f64) {
+            || f.type == f16 || f.type == f32 || f.type == f64) {
             dst.[f] = src.[f];
         }
         $or {}
@@ -351,7 +352,7 @@ pub fun fmt[T](w: *writer.Writer, v: *T) res[usize, WriteError] {
         }
         $or (f.type == i8 || f.type == i16 || f.type == i32 || f.type == i64
             || f.type == u8 || f.type == u16 || f.type == u32 || f.type == u64
-            || f.type == f32 || f.type == f64) {
+            || f.type == f16 || f.type == f32 || f.type == f64) {
             val label: res[usize, WriteError] = write_label(w, first, f.name);
             if (sel label.err) { ret res[usize, WriteError].err{writer.advance(label.err, total)}; }
             total = total + label.ok;
@@ -379,6 +380,8 @@ use std.types.string.str_equals;
 rec DV2    { x: i64; y: i64; }
 #[testing]
 rec DMix   { i: i32; u: u16; f: f64; g: f32; }
+#[testing]
+rec DHalf  { h: f16; s: f32; }
 #[testing]
 rec DFlags { on: bool; c: char; n: u8; }
 
@@ -452,6 +455,12 @@ test eq__flat_records {
     var nan: u64 = 0x7FF8000000000000;
     memory.raw_copy(?nz.f, ?nan, 8);
     if (eq[DMix](?nz, ?nz)) { ret 7; }
+
+    var ha: DHalf = DHalf{h: 0.5, s: 0.25};
+    var hb: DHalf = ha;
+    if (!eq[DHalf](?ha, ?hb)) { ret 8; }
+    hb.h = 0.75;
+    if (eq[DHalf](?ha, ?hb)) { ret 9; }
     ret 0;
 }
 
@@ -500,6 +509,12 @@ test hash__follows_eq_at_every_depth {
     var nz:   DMix = z;
     memory.raw_copy(?nz.f, ?negz, 8);
     if (hash[DMix](?z) != hash[DMix](?nz)) { ret 11; }
+
+    var negz16: u16   = 0x8000;
+    var hz:     DHalf = DHalf{h: 0.0, s: 0.0};
+    var hnz:    DHalf = hz;
+    memory.raw_copy(?hnz.h, ?negz16, 2);
+    if (hash[DHalf](?hz) != hash[DHalf](?hnz)) { ret 13; }
 
     var fa: DFlags = DFlags{on: true, c: 'q', n: 200};
     var fb: DFlags = DFlags{on: true, c: 'q', n: 200};
@@ -553,6 +568,25 @@ test fmt__flat_and_empty_records {
     if (sel rh.err) { ret 3; }
     scratch[cap.len] = 0;
     if (!str_equals(?scratch[0], "NHolder{e=NEmpty{}, z=9}")) { ret 4; }
+    ret 0;
+}
+
+# f16 and f32 leaves render at their own width, as write_value renders them.
+# the expected digits are numpy's shortest repr of the same binary16 and binary32
+test fmt__f16_and_f32_fields_at_own_width {
+    var scratch: [64]u8;
+    var cap:     DCap;
+    var w:       writer.Writer = cap_writer(?cap, ?scratch[0], 64);
+
+    var v:   DHalf;
+    var h16: u16 = 0x2E66;
+    var s32: u32 = 0x3DCCCCCD;
+    memory.raw_copy(?v.h, ?h16, 2);
+    memory.raw_copy(?v.s, ?s32, 4);
+    val r: res[usize, WriteError] = fmt[DHalf](?w, ?v);
+    if (sel r.err) { ret 1; }
+    scratch[cap.len] = 0;
+    if (!str_equals(?scratch[0], "DHalf{h=0.1, s=0.1}")) { ret 2; }
     ret 0;
 }
 
