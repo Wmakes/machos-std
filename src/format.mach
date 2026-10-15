@@ -612,7 +612,7 @@ pub fun write_f16(w: *writer.Writer, n: f16) res[usize, WriteError] {
 # zero `0x0p+0`, the fraction left-aligned in hex digits with trailing zero
 # digits trimmed (and the point with them), the binary exponent always signed.
 # `inf`, `nan` and their negatives as printf writes them. every finite value
-# parses back bit for bit through std.text.parse.
+# parses back bit for bit through the std.text.parse hex parsers.
 # ---
 # w:    target writer
 # fmt:  the pattern's format
@@ -1943,7 +1943,9 @@ $if (capability.HOSTED) {
         or (how == TRIP_SHORTEST) { r = write_float(?w, fmt, bits); }
         or                        { r = write_float_g(?w, fmt, bits, precision); }
         if (sel r.err)            { ret false; }
-        val back: res[u128, ParseError] = parse.parse_float(fmt, ?s[0], tb.len, true);
+        var radix: parse.Radix = parse.Radix.decimal{};
+        if (how == TRIP_HEX) { radix = parse.Radix.hex{}; }
+        val back: res[u128, ParseError] = parse.parse_float(fmt, radix, ?s[0], tb.len, true);
         if (sel back.err) { ret false; }
         ret back.ok == bits;
     }

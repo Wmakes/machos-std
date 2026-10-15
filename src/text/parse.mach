@@ -590,23 +590,46 @@ fun scan_hex(f: ieee.Format, s: str, len: usize, i: *usize, neg: bool) res[u128,
     ret res[u128, ParseError].ok{ieee.pack(f, neg, acc, exp, sticky)};
 }
 
+# which literal form a float parse reads
+# ---
+# decimal: digits with an optional point and an optional `e` exponent
+# hex:     a C99 hex float, `0x` or `0X` then hex digits with an optional point
+#          and an optional `p` exponent
+pub tag Radix: u8 {
+    decimal;
+    hex;
+}
+
+# the offset where s at i stops being `0x` then a hex digit or a point and one
+fun hex_stop(s: str, len: usize, i: usize) usize {
+    var j: usize = i;
+    if (j < len && s[j] == '0') {
+        j = j + 1;
+        if (j < len && (s[j] == 'x' || s[j] == 'X')) {
+            j = j + 1;
+            if (j < len && s[j] == '.') { j = j + 1; }
+        }
+    }
+    ret j;
+}
+
 # parse a float of any ieee.Format row from the first `len` bytes of `s`
 #
-# the one parse every width runs. accepts an optional sign, then `inf`, `nan`, a
-# decimal (digits with an optional point and an `e` exponent) or a C99 hex float
-# (`0x`, hex digits with an optional point and an optional `p` exponent), with
-# `_` separators between digits. both forms round to nearest, ties to even, at
-# the format's own precision, into the subnormal range and to inf. a sign before
-# `nan` is ignored. a `0x` with no hex digit after it reads as the decimal 0.
+# the one parse every width and radix runs. accepts an optional sign, then `inf`,
+# `nan`, or a literal of the given radix, with `_` separators between digits.
+# both radices round to nearest, ties to even, at the format's own precision,
+# into the subnormal range and to inf. a sign before `nan` is ignored. a decimal
+# parse never reads hex: `0x1p3` is the decimal 0 followed by a stray `x`.
 # ---
 # f:     the format to round into
+# radix: the literal form to read
 # s:     the bytes to parse
 # len:   the number of bytes available in s
 # whole: require the span be the number exactly, with no leading whitespace or
 #        trailing byte; otherwise skip leading whitespace and stop at the first
 #        byte that is not part of a float
 # ret:   the pattern in the low end, or the failure
-pub fun parse_float(f: ieee.Format, s: str, len: usize, whole: bool) res[u128, ParseError] {
+pub fun parse_float(f: ieee.Format, radix: Radix, s: str, len: usize, whole: bool) res[u128, ParseError] {
     if (len == 0) { ret res[u128, ParseError].err{ParseError.empty{}}; }
 
     var i: usize = 0;
@@ -639,7 +662,8 @@ pub fun parse_float(f: ieee.Format, s: str, len: usize, whole: bool) res[u128, P
     }
 
     var bits: u128 = 0;
-    if (hex_opens(s, len, i)) {
+    if (sel radix.hex) {
+        if (!hex_opens(s, len, i)) { ret res[u128, ParseError].err{ParseError.syntax{hex_stop(s, len, i)}}; }
         i = i + 2;
         val h: res[u128, ParseError] = scan_hex(f, s, len, ?i, neg);
         if (sel h.err) { ret h; }
@@ -693,8 +717,8 @@ fun as_f16(r: res[u128, ParseError]) res[f16, ParseError] {
 
 # parse a 64-bit floating point number prefix from a string
 #
-# decimal or hex, correctly rounded, as parse_float describes. skips leading
-# whitespace and stops at the first character that is not part of a valid float.
+# decimal, correctly rounded, as parse_float describes. skips leading whitespace
+# and stops at the first character that is not part of a valid float.
 # use parse_f64_exact to require full input consumption, or parse_f64_len for a
 # span that is not null-terminated.
 # ---
@@ -715,19 +739,19 @@ pub fun parse_f64(s: str) res[f64, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f64_len(s: str, len: usize) res[f64, ParseError] {
-    ret as_f64(parse_float(ieee.F64, s, len, false));
+    ret as_f64(parse_float(ieee.F64, Radix.decimal{}, s, len, false));
 }
 
 # parse a 64-bit floating point number from a string, requiring full consumption
 #
-# handles optional sign, a decimal or hex significand, an exponent, and the
-# special values inf, -inf, nan, +inf, +nan. returns an error if there are any
+# handles optional sign, integer part, fractional part, and exponent.
+# also handles special values inf, -inf, nan, +inf, +nan. returns an error if there are any
 # characters remaining after the number. leading whitespace is also rejected.
 # ---
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f64_exact(s: str) res[f64, ParseError] {
-    ret as_f64(parse_float(ieee.F64, s, str_len(s), true));
+    ret as_f64(parse_float(ieee.F64, Radix.decimal{}, s, str_len(s), true));
 }
 
 # parse a 32-bit floating point number prefix from a string
@@ -747,7 +771,7 @@ pub fun parse_f32(s: str) res[f32, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f32_len(s: str, len: usize) res[f32, ParseError] {
-    ret as_f32(parse_float(ieee.F32, s, len, false));
+    ret as_f32(parse_float(ieee.F32, Radix.decimal{}, s, len, false));
 }
 
 # parse a 32-bit floating point number from a string, requiring full consumption
@@ -755,7 +779,7 @@ pub fun parse_f32_len(s: str, len: usize) res[f32, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f32_exact(s: str) res[f32, ParseError] {
-    ret as_f32(parse_float(ieee.F32, s, str_len(s), true));
+    ret as_f32(parse_float(ieee.F32, Radix.decimal{}, s, str_len(s), true));
 }
 
 # parse a 16-bit floating point number prefix from a string
@@ -775,7 +799,7 @@ pub fun parse_f16(s: str) res[f16, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f16_len(s: str, len: usize) res[f16, ParseError] {
-    ret as_f16(parse_float(ieee.F16, s, len, false));
+    ret as_f16(parse_float(ieee.F16, Radix.decimal{}, s, len, false));
 }
 
 # parse a 16-bit floating point number from a string, requiring full consumption
@@ -783,7 +807,94 @@ pub fun parse_f16_len(s: str, len: usize) res[f16, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f16_exact(s: str) res[f16, ParseError] {
-    ret as_f16(parse_float(ieee.F16, s, str_len(s), true));
+    ret as_f16(parse_float(ieee.F16, Radix.decimal{}, s, str_len(s), true));
+}
+
+# parse a 64-bit C99 hex float prefix from a string
+#
+# `0x` then hex digits with an optional point and an optional `p` exponent, as
+# parse_float describes, rounded half to even at f64's own precision. skips
+# leading whitespace and stops at the first character past the float.
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f64_hex(s: str) res[f64, ParseError] {
+    ret parse_f64_hex_len(s, str_len(s));
+}
+
+# parse a 64-bit C99 hex float prefix from the first `len` bytes of `s`
+# ---
+# s:   the bytes to parse
+# len: the number of bytes available in s
+# ret: the parsed value, or an error message
+pub fun parse_f64_hex_len(s: str, len: usize) res[f64, ParseError] {
+    ret as_f64(parse_float(ieee.F64, Radix.hex{}, s, len, false));
+}
+
+# parse a 64-bit C99 hex float from a string, requiring full consumption
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f64_hex_exact(s: str) res[f64, ParseError] {
+    ret as_f64(parse_float(ieee.F64, Radix.hex{}, s, str_len(s), true));
+}
+
+# parse a 32-bit C99 hex float prefix from a string
+#
+# `0x` then hex digits with an optional point and an optional `p` exponent, as
+# parse_float describes, rounded half to even at f32's own precision. skips
+# leading whitespace and stops at the first character past the float.
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f32_hex(s: str) res[f32, ParseError] {
+    ret parse_f32_hex_len(s, str_len(s));
+}
+
+# parse a 32-bit C99 hex float prefix from the first `len` bytes of `s`
+# ---
+# s:   the bytes to parse
+# len: the number of bytes available in s
+# ret: the parsed value, or an error message
+pub fun parse_f32_hex_len(s: str, len: usize) res[f32, ParseError] {
+    ret as_f32(parse_float(ieee.F32, Radix.hex{}, s, len, false));
+}
+
+# parse a 32-bit C99 hex float from a string, requiring full consumption
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f32_hex_exact(s: str) res[f32, ParseError] {
+    ret as_f32(parse_float(ieee.F32, Radix.hex{}, s, str_len(s), true));
+}
+
+# parse a 16-bit C99 hex float prefix from a string
+#
+# `0x` then hex digits with an optional point and an optional `p` exponent, as
+# parse_float describes, rounded half to even at f16's own precision. skips
+# leading whitespace and stops at the first character past the float.
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f16_hex(s: str) res[f16, ParseError] {
+    ret parse_f16_hex_len(s, str_len(s));
+}
+
+# parse a 16-bit C99 hex float prefix from the first `len` bytes of `s`
+# ---
+# s:   the bytes to parse
+# len: the number of bytes available in s
+# ret: the parsed value, or an error message
+pub fun parse_f16_hex_len(s: str, len: usize) res[f16, ParseError] {
+    ret as_f16(parse_float(ieee.F16, Radix.hex{}, s, len, false));
+}
+
+# parse a 16-bit C99 hex float from a string, requiring full consumption
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f16_hex_exact(s: str) res[f16, ParseError] {
+    ret as_f16(parse_float(ieee.F16, Radix.hex{}, s, str_len(s), true));
 }
 
 # whether parse_u64(s, base) succeeds with want
@@ -1043,6 +1154,39 @@ fun t16(s: str) u64 {
     ret bits::u64;
 }
 
+# parse all of s as an f32 hex float and return its pattern, a sentinel on error
+#[testing]
+fun x32(s: str) u64 {
+    val r: res[f32, ParseError] = parse_f32_hex_exact(s);
+    if (sel r.err) { ret 0xDEADBEEF00; }
+    val v:    f32 = r.ok;
+    var bits: u32;
+    memory.raw_copy(?bits, ?v, 4);
+    ret bits::u64;
+}
+
+# parse all of s as an f16 hex float and return its pattern, a sentinel on error
+#[testing]
+fun x16(s: str) u64 {
+    val r: res[f16, ParseError] = parse_f16_hex_exact(s);
+    if (sel r.err) { ret 0xDEADBEEF00; }
+    val v:    f16 = r.ok;
+    var bits: u16;
+    memory.raw_copy(?bits, ?v, 2);
+    ret bits::u64;
+}
+
+# parse all of s as an f64 hex float and return its pattern, a sentinel on error
+#[testing]
+fun x64(s: str) u128 {
+    val r: res[f64, ParseError] = parse_f64_hex_exact(s);
+    if (sel r.err) { ret 1::u128 << 100; }
+    val v:    f64 = r.ok;
+    var bits: u64;
+    memory.raw_copy(?bits, ?v, 8);
+    ret bits::u128;
+}
+
 # 1 + 2^-24 + 10^-29 sits above the f32 midpoint 1 + 2^-24 by far less than half
 # an f64 ulp, so f64 rounds it onto the midpoint and the cast then ties to even,
 # down. the f32 parse rounds once, up. glibc strtof gives 0x3F800001 and
@@ -1108,43 +1252,43 @@ test parse_f32__correctly_rounded_edges {
 # literal's exact binary value half to even at 24 bits
 test parse_f32__hex_rounds_half_to_even {
     # 2^-149
-    if (t32("0x1p-149") != 0x00000001) { ret 1; }
+    if (x32("0x1p-149") != 0x00000001) { ret 1; }
     # 0x1.998p-4 is exact in f32
-    if (t32("0x1.998p-4") != 0x3DCCC000) { ret 2; }
+    if (x32("0x1.998p-4") != 0x3DCCC000) { ret 2; }
     # 1 + 2^-24, a tie: even is 1
-    if (t32("0x1.000001p0") != 0x3F800000) { ret 3; }
+    if (x32("0x1.000001p0") != 0x3F800000) { ret 3; }
     # 1 + 3 * 2^-24, a tie: even is up
-    if (t32("0x1.000003p0") != 0x3F800002) { ret 4; }
+    if (x32("0x1.000003p0") != 0x3F800002) { ret 4; }
     # just over 1 + 2^-24: up
-    if (t32("0x1.0000010000000000000000001p0") != 0x3F800001) { ret 5; }
+    if (x32("0x1.0000010000000000000000001p0") != 0x3F800001) { ret 5; }
     # 2^-150, a tie at the subnormal floor: even is zero
-    if (t32("0x1p-150") != 0x00000000) { ret 6; }
+    if (x32("0x1p-150") != 0x00000000) { ret 6; }
     # just over 2^-150: up to the smallest subnormal
-    if (t32("0x1.0000000000000000000000001p-150") != 0x00000001) { ret 7; }
+    if (x32("0x1.0000000000000000000000001p-150") != 0x00000001) { ret 7; }
     # 1.5 * 2^-149, a subnormal tie: even is 2
-    if (t32("0x1.8p-149") != 0x00000002) { ret 8; }
+    if (x32("0x1.8p-149") != 0x00000002) { ret 8; }
     # (2^23 - 1) * 2^-149, the largest subnormal
-    if (t32("0x1.fffffcp-127") != 0x007FFFFF) { ret 9; }
+    if (x32("0x1.fffffcp-127") != 0x007FFFFF) { ret 9; }
     # 2^-126, the smallest normal
-    if (t32("0x1p-126") != 0x00800000) { ret 10; }
+    if (x32("0x1p-126") != 0x00800000) { ret 10; }
     # the largest finite
-    if (t32("0x1.fffffep127") != 0x7F7FFFFF) { ret 11; }
+    if (x32("0x1.fffffep127") != 0x7F7FFFFF) { ret 11; }
     # the midpoint past the largest finite: even is inf
-    if (t32("0x1.ffffffp127") != 0x7F800000) { ret 12; }
+    if (x32("0x1.ffffffp127") != 0x7F800000) { ret 12; }
     # just under that midpoint: the largest finite
-    if (t32("0x1.fffffefffp127") != 0x7F7FFFFF) { ret 13; }
+    if (x32("0x1.fffffefffp127") != 0x7F7FFFFF) { ret 13; }
     # 2^128 overflows
-    if (t32("0x1p128") != 0x7F800000) { ret 14; }
+    if (x32("0x1p128") != 0x7F800000) { ret 14; }
     # negative zero
-    if (t32("-0x0p0") != 0x80000000) { ret 15; }
+    if (x32("-0x0p0") != 0x80000000) { ret 15; }
     # upper case and a signed exponent
-    if (t32("0X1P+3") != 0x41000000) { ret 16; }
+    if (x32("0X1P+3") != 0x41000000) { ret 16; }
     # a leading point
-    if (t32("0x.8p1") != 0x3F800000) { ret 17; }
+    if (x32("0x.8p1") != 0x3F800000) { ret 17; }
     # no exponent
-    if (t32("0x10") != 0x41800000) { ret 18; }
+    if (x32("0x10") != 0x41800000) { ret 18; }
     # a negative value
-    if (t32("-0x1.8p1") != 0xC0400000) { ret 19; }
+    if (x32("-0x1.8p1") != 0xC0400000) { ret 19; }
     ret 0;
 }
 
@@ -1192,31 +1336,31 @@ test parse_f16__correctly_rounded_edges {
 # bits: 0x1.ffcp15 is 2047 * 2^5 = 65504, and 0x1.998p-4 keeps 0x266 of 0x998
 test parse_f16__hex_rounds_half_to_even {
     # 2^-24
-    if (t16("0x1p-24") != 0x0001) { ret 1; }
+    if (x16("0x1p-24") != 0x0001) { ret 1; }
     # 2^-25, a tie at the floor: even is zero
-    if (t16("0x1p-25") != 0x0000) { ret 2; }
+    if (x16("0x1p-25") != 0x0000) { ret 2; }
     # 1.5 * 2^-24, a subnormal tie: even is 2
-    if (t16("0x1.8p-24") != 0x0002) { ret 3; }
+    if (x16("0x1.8p-24") != 0x0002) { ret 3; }
     # 1 + 2^-11, a tie: even is 1
-    if (t16("0x1.002p0") != 0x3C00) { ret 4; }
+    if (x16("0x1.002p0") != 0x3C00) { ret 4; }
     # 1 + 3 * 2^-11, a tie: even is up
-    if (t16("0x1.006p0") != 0x3C02) { ret 5; }
+    if (x16("0x1.006p0") != 0x3C02) { ret 5; }
     # just over 1 + 2^-11: up
-    if (t16("0x1.0020001p0") != 0x3C01) { ret 6; }
+    if (x16("0x1.0020001p0") != 0x3C01) { ret 6; }
     # 1023 * 2^-24, the largest subnormal
-    if (t16("0x1.ff8p-15") != 0x03FF) { ret 7; }
+    if (x16("0x1.ff8p-15") != 0x03FF) { ret 7; }
     # 2^-14, the smallest normal
-    if (t16("0x1p-14") != 0x0400) { ret 8; }
+    if (x16("0x1p-14") != 0x0400) { ret 8; }
     # the largest finite
-    if (t16("0x1.ffcp15") != 0x7BFF) { ret 9; }
+    if (x16("0x1.ffcp15") != 0x7BFF) { ret 9; }
     # the midpoint past the largest finite: even is inf
-    if (t16("0x1.ffep15") != 0x7C00) { ret 10; }
+    if (x16("0x1.ffep15") != 0x7C00) { ret 10; }
     # just under that midpoint: the largest finite
-    if (t16("0x1.ffdfp15") != 0x7BFF) { ret 11; }
+    if (x16("0x1.ffdfp15") != 0x7BFF) { ret 11; }
     # negative zero
-    if (t16("-0x0p+0") != 0x8000) { ret 12; }
+    if (x16("-0x0p+0") != 0x8000) { ret 12; }
     # 0x1.998p-4 keeps 10 of its 12 fraction bits, the dropped two zero
-    if (t16("0x1.998p-4") != 0x2E66) { ret 13; }
+    if (x16("0x1.998p-4") != 0x2E66) { ret 13; }
     ret 0;
 }
 
@@ -1237,25 +1381,25 @@ test parse_f64__subnormal_and_overflow_edges {
 # every expected pattern is glibc strtod's
 test parse_f64__hex_rounds_half_to_even {
     # 2^-1074
-    if (pbits("0x1p-1074") != 0x0000000000000001) { ret 1; }
+    if (x64("0x1p-1074") != 0x0000000000000001) { ret 1; }
     # 2^-1075, a tie at the floor: even is zero
-    if (pbits("0x1p-1075") != 0x0000000000000000) { ret 2; }
+    if (x64("0x1p-1075") != 0x0000000000000000) { ret 2; }
     # 1.5 * 2^-1074, a subnormal tie: even is 2
-    if (pbits("0x1.8p-1074") != 0x0000000000000002) { ret 3; }
+    if (x64("0x1.8p-1074") != 0x0000000000000002) { ret 3; }
     # the largest subnormal
-    if (pbits("0x0.fffffffffffffp-1022") != 0x000FFFFFFFFFFFFF) { ret 4; }
+    if (x64("0x0.fffffffffffffp-1022") != 0x000FFFFFFFFFFFFF) { ret 4; }
     # 1 + 2^-53, a tie: even is 1
-    if (pbits("0x1.00000000000008p0") != 0x3FF0000000000000) { ret 5; }
+    if (x64("0x1.00000000000008p0") != 0x3FF0000000000000) { ret 5; }
     # 1 + 3 * 2^-53, a tie: even is up
-    if (pbits("0x1.00000000000018p0") != 0x3FF0000000000002) { ret 6; }
+    if (x64("0x1.00000000000018p0") != 0x3FF0000000000002) { ret 6; }
     # the largest finite
-    if (pbits("0x1.fffffffffffffp1023") != 0x7FEFFFFFFFFFFFFF) { ret 7; }
+    if (x64("0x1.fffffffffffffp1023") != 0x7FEFFFFFFFFFFFFF) { ret 7; }
     # the midpoint past the largest finite: even is inf
-    if (pbits("0x1.fffffffffffff8p1023") != 0x7FF0000000000000) { ret 8; }
+    if (x64("0x1.fffffffffffff8p1023") != 0x7FF0000000000000) { ret 8; }
     # just under that midpoint: the largest finite
-    if (pbits("0x1.fffffffffffff7ffp1023") != 0x7FEFFFFFFFFFFFFF) { ret 9; }
+    if (x64("0x1.fffffffffffff7ffp1023") != 0x7FEFFFFFFFFFFFFF) { ret 9; }
     # 0x1.998p-4
-    if (pbits("0x1.998p-4") != 0x3FB9980000000000) { ret 10; }
+    if (x64("0x1.998p-4") != 0x3FB9980000000000) { ret 10; }
     ret 0;
 }
 
@@ -1263,36 +1407,65 @@ test parse_f64__hex_rounds_half_to_even {
 # saturates rather than wrapping, the prefix forms skip whitespace and stop at the
 # first byte past the number, and a `0x` with no digit after it is the decimal 0
 test parse_float__hex_grammar_and_bounds {
-    if (t32("0x1_0p0") != 0x41800000)                          { ret 1; }
+    if (x32("0x1_0p0") != 0x41800000)                          { ret 1; }
     if (t32("1e99999999999999999999") != 0x7F800000)           { ret 2; }
     if (t32("-1e-99999999999999999999") != 0x80000000)         { ret 3; }
-    if (t16("0x1p-99999999999999999999") != 0)                 { ret 4; }
-    if (t16("0x1p99999999999999999999") != 0x7C00)             { ret 5; }
+    if (x16("0x1p-99999999999999999999") != 0)                 { ret 4; }
+    if (x16("0x1p99999999999999999999") != 0x7C00)             { ret 5; }
     if (pbits("1e99999999999999999999") != 0x7FF0000000000000) { ret 6; }
 
-    val p: res[f32, ParseError] = parse_f32("  0x1.8p1 tail");
+    val p: res[f32, ParseError] = parse_f32_hex("  0x1.8p1 tail");
     if (sel p.err)   { ret 7; }
     if (p.ok != 3.0) { ret 7; }
-    val z: res[f16, ParseError] = parse_f16_len("0xg", 3);
-    if (sel z.err)        { ret 8; }
-    if (z.ok::f32 != 0.0) { ret 8; }
+    val q: res[f64, ParseError] = parse_f64_hex_len("0x1p3p9", 5);
+    if (sel q.err)   { ret 8; }
+    if (q.ok != 8.0) { ret 8; }
 
-    val e1: res[f32, ParseError] = parse_f32_exact("0x1p");
+    val e1: res[f32, ParseError] = parse_f32_hex_exact("0x1p");
     if (!sel e1.err)        { ret 9; }
     if (!sel e1.err.syntax) { ret 9; }
     if (e1.err.syntax != 4) { ret 9; }
-    val e2: res[f32, ParseError] = parse_f32_exact("0x");
+    # a hex parse needs the prefix and a digit after it
+    val e2: res[f32, ParseError] = parse_f32_hex_exact("0x");
     if (!sel e2.err)        { ret 10; }
     if (!sel e2.err.syntax) { ret 10; }
-    if (e2.err.syntax != 1) { ret 10; }
-    val e3: res[f16, ParseError] = parse_f16_exact("0x1.8p1x");
+    if (e2.err.syntax != 2) { ret 10; }
+    val e3: res[f16, ParseError] = parse_f16_hex_exact("0x1.8p1x");
     if (!sel e3.err)        { ret 11; }
     if (!sel e3.err.syntax) { ret 11; }
     if (e3.err.syntax != 7) { ret 11; }
-    val e4: res[f16, ParseError] = parse_f16_exact("");
-    if (!sel e4.err)                                                               { ret 12; }
-    if (!sel e4.err.empty)                                                         { ret 12; }
-    if (t16("inf") != 0x7C00 || t16("-inf") != 0xFC00 || t32("nan") != 0x7FC00000) { ret 13; }
+    val e4: res[f16, ParseError] = parse_f16_hex("-1.5");
+    if (!sel e4.err)        { ret 12; }
+    if (!sel e4.err.syntax) { ret 12; }
+    if (e4.err.syntax != 1) { ret 12; }
+    val e5: res[f64, ParseError] = parse_f64_hex_exact("0x.p1");
+    if (!sel e5.err)                                                               { ret 13; }
+    if (!sel e5.err.syntax)                                                        { ret 13; }
+    if (e5.err.syntax != 3)                                                        { ret 13; }
+    if (x16("inf") != 0x7C00 || x16("-inf") != 0xFC00 || x32("nan") != 0x7FC00000) { ret 14; }
+    ret 0;
+}
+
+# the decimal parsers keep their grammar: `0x1p3` is the decimal 0 then a stray
+# `x`, so a prefix parse gives 0 and an exact one refuses the `x` at offset 1,
+# exactly as before hex parsing existed. the hex parsers read it as 8.
+test parse_float__decimal_parsers_never_read_hex {
+    val d: res[f64, ParseError] = parse_f64("0x1p3");
+    if (sel d.err)   { ret 1; }
+    if (d.ok != 0.0) { ret 1; }
+    val e: res[f64, ParseError] = parse_f64_exact("0x1p3");
+    if (!sel e.err)        { ret 2; }
+    if (!sel e.err.syntax) { ret 2; }
+    if (e.err.syntax != 1) { ret 2; }
+    val l: res[f64, ParseError] = parse_f64_len("0x1p3", 5);
+    if (sel l.err)                                                    { ret 3; }
+    if (l.ok != 0.0)                                                  { ret 3; }
+    if (t32("0x1p3") != 0xDEADBEEF00 || t16("0x1p3") != 0xDEADBEEF00) { ret 4; }
+
+    val h: res[f64, ParseError] = parse_f64_hex_exact("0x1p3");
+    if (sel h.err)                                            { ret 5; }
+    if (h.ok != 8.0)                                          { ret 5; }
+    if (x32("0x1p3") != 0x41000000 || x16("0x1p3") != 0x4800) { ret 6; }
     ret 0;
 }
 
@@ -1301,16 +1474,16 @@ test parse_float__hex_grammar_and_bounds {
 # is its smallest subnormal
 test parse_float__a_new_row_is_data_only {
     val bf16: ieee.Format           = ieee.Format{mant_bits: 7, exp_bits: 8, bias: 127};
-    val a:    res[u128, ParseError] = parse_float(bf16, "1.00390625", 10, true);
+    val a:    res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "1.00390625", 10, true);
     if (sel a.err)      { ret 1; }
     if (a.ok != 0x3F80) { ret 1; }
-    val b: res[u128, ParseError] = parse_float(bf16, "1.01171875", 10, true);
+    val b: res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "1.01171875", 10, true);
     if (sel b.err)      { ret 2; }
     if (b.ok != 0x3F82) { ret 2; }
-    val c: res[u128, ParseError] = parse_float(bf16, "0x1p-133", 8, true);
+    val c: res[u128, ParseError] = parse_float(bf16, Radix.hex{}, "0x1p-133", 8, true);
     if (sel c.err)      { ret 3; }
     if (c.ok != 0x0001) { ret 3; }
-    val d: res[u128, ParseError] = parse_float(bf16, "-3.0e38", 7, true);
+    val d: res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "-3.0e38", 7, true);
     if (sel d.err)      { ret 4; }
     if (d.ok != 0xFF62) { ret 4; }
     ret 0;
