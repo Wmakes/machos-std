@@ -16,6 +16,7 @@ use std.system.capability;
 use std.types.error.err;
 use std.types.result.res;
 
+use std.collections.slice.Slice;
 use std.collections.vector;
 use std.collections.vector.Vector;
 
@@ -146,15 +147,16 @@ pub fun read_all(a: *A.Allocator, r: *Reader) res[Vector[u8], ReadError] {
             ret res[Vector[u8], ReadError].err{ReadError.alloc{reserved.err}};
         }
 
-        val got: res[usize, ReadError] = read(r, ?v.data[v.len], CHUNK_SIZE);
+        val room: Slice[u8]             = vector.spare[u8](?v);
+        val got:  res[usize, ReadError] = read(r, room.data, CHUNK_SIZE);
         if (sel got.err) {
             if (sel got.err.eof) { ret res[Vector[u8], ReadError].ok{v}; }
-            val delivered: usize = v.len;
+            val delivered: usize = vector.length[u8](?v);
             vector.dnit[u8](?v);
             ret res[Vector[u8], ReadError].err{advance(got.err, delivered)};
         }
 
-        v.len = v.len + got.ok;
+        vector.commit[u8](?v, got.ok);
     }
 
     # NOTE: unreachable, the loop above exits by return
@@ -179,9 +181,11 @@ pub fun read_str(a: *A.Allocator, r: *Reader) res[OwnedString, ReadError] {
         vector.dnit[u8](?v);
         ret res[OwnedString, ReadError].err{ReadError.alloc{rr.err}};
     }
-    v.data[v.len] = 0;
+    val tail: Slice[u8] = vector.spare[u8](?v);
+    tail.data[0] = 0;
 
-    ret res[OwnedString, ReadError].ok{owned_adopt(a, v.data::str, v.len, v.cap)};
+    val bytes: Slice[u8] = vector.items[u8](?v);
+    ret res[OwnedString, ReadError].ok{owned_adopt(a, bytes.data::str, bytes.size, vector.capacity[u8](?v))};
 }
 
 $if (capability.HOSTED) {

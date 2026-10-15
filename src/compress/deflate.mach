@@ -47,6 +47,7 @@ $if (capability.HOSTED) {
     use std.allocator.testing;
 }
 
+use std.collections.slice.Slice;
 use V: std.collections.vector;
 use F: std.compress.format;
 use I: std.compress.inflate;
@@ -1220,9 +1221,10 @@ fun grow(z: *Deflater, out: *V.Vector[u8], src: *u8, src_len: usize) res[usize, 
     var in_off: usize = 0;
 
     for (!is_done(z)) {
-        if (out.len == out.cap) {
-            var next: usize = out.cap * 2;
-            if (out.cap != 0 && next <= out.cap) {
+        val cap: usize = V.capacity[u8](out);
+        if (V.length[u8](out) == cap) {
+            var next: usize = cap * 2;
+            if (cap != 0 && next <= cap) {
                 ret res[usize, DeflateError].err{DeflateError.alloc{A.Error.overflow{}}};
             }
             if (next < 4096) { next = 4096; }
@@ -1230,17 +1232,18 @@ fun grow(z: *Deflater, out: *V.Vector[u8], src: *u8, src_len: usize) res[usize, 
             if (sel e.err) { ret res[usize, DeflateError].err{DeflateError.alloc{e.err}}; }
         }
 
-        var r: res[I.Progress, DeflateError];
-        if (in_off == src_len) { r = finish(z, ?out.data[out.len], out.cap - out.len); }
-        or                     { r = compress(z, ?src[in_off], src_len - in_off, ?out.data[out.len], out.cap - out.len); }
+        val room: Slice[u8] = V.spare[u8](out);
+        var r:    res[I.Progress, DeflateError];
+        if (in_off == src_len) { r = finish(z, room.data, room.size); }
+        or                     { r = compress(z, ?src[in_off], src_len - in_off, room.data, room.size); }
         if (sel r.err)         { ret res[usize, DeflateError].err{r.err}; }
 
         val p: I.Progress = r.ok;
-        in_off  = in_off + p.consumed;
-        out.len = out.len + p.written;
+        in_off = in_off + p.consumed;
+        V.commit[u8](out, p.written);
     }
 
-    ret res[usize, DeflateError].ok{out.len};
+    ret res[usize, DeflateError].ok{V.length[u8](out)};
 }
 
 # compress a whole input into a vector that grows as needed
