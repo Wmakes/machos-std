@@ -28,6 +28,7 @@ $if (capability.HOSTED) {
     use std.allocator.testing;
 }
 
+use std.collections.slice.Slice;
 use V: std.collections.vector;
 use D: std.compress.deflate;
 use I: std.compress.inflate;
@@ -254,28 +255,28 @@ fun grow(z: *Decompressor, out: *V.Vector[u8], src: *u8, src_len: usize) res[usi
     var in_off: usize = 0;
 
     for (!is_done(z)) {
-        if (out.len == out.cap) {
-            var next: usize = out.cap * 2;
+        if (V.length[u8](out) == V.capacity[u8](out)) {
+            var next: usize = V.capacity[u8](out) * 2;
             if (next < 4096) { next = 4096; }
 
             val e: res[usize, A.Error] = V.ensure[u8](out, next);
             if (sel e.err) { ret res[usize, I.InflateError].err{I.InflateError.alloc{e.err}}; }
         }
 
-        val r: res[I.Progress, I.InflateError] = decompress(z, ?src[in_off], src_len - in_off,
-            ?out.data[out.len], out.cap - out.len);
-        if (sel r.err) { ret res[usize, I.InflateError].err{I.advance(r.err, in_off, out.len)}; }
+        val room: Slice[u8]                       = V.spare[u8](out);
+        val r:    res[I.Progress, I.InflateError] = decompress(z, ?src[in_off], src_len - in_off, room.data, room.size);
+        if (sel r.err) { ret res[usize, I.InflateError].err{I.advance(r.err, in_off, V.length[u8](out))}; }
 
         val p: I.Progress = r.ok;
-        in_off  = in_off + p.consumed;
-        out.len = out.len + p.written;
+        in_off = in_off + p.consumed;
+        V.commit[u8](out, p.written);
 
         if (p.status == I.NEED_INPUT && in_off >= src_len) {
-            ret res[usize, I.InflateError].err{I.truncated(in_off, out.len)};
+            ret res[usize, I.InflateError].err{I.truncated(in_off, V.length[u8](out))};
         }
     }
 
-    ret res[usize, I.InflateError].ok{out.len};
+    ret res[usize, I.InflateError].ok{V.length[u8](out)};
 }
 
 # decompress a whole zlib stream into a vector that grows as needed
