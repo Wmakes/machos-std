@@ -83,6 +83,7 @@ fwd identities.READ_AUTHORIZED;
 $if ($mach.build.os == $mach.os.linux)  { use nofollow_os: std.system.os.linux; }
 $or ($mach.build.os == $mach.os.darwin) { use nofollow_os: std.system.os.darwin; }
 
+use std.collections.slice.Slice;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use ehex:         std.encoding.hex;
@@ -2957,11 +2958,12 @@ fun t_session_init(out: *TestSession, alloc: *A.Allocator, root: *Root) err[Erro
 
 #[testing]
 fun t_session_release_claims(session: *TestSession) err[Error] {
-    for (session.claims.len != 0) {
-        val owned:    *Claim     = session.claims.data[session.claims.len - 1];
-        val released: err[Error] = release_claim(owned);
+    for (!vector.is_empty[*Claim](?session.claims)) {
+        val held:     Slice[*Claim] = vector.items[*Claim](?session.claims);
+        val owned:    *Claim        = held.data[held.size - 1];
+        val released: err[Error]    = release_claim(owned);
         if (sel released.err) { ret released; }
-        session.claims.len = session.claims.len - 1;
+        vector.pop[*Claim](?session.claims);
         A.deallocate[Claim](session.alloc, owned, 1);
     }
     ret err[Error].ok{};
