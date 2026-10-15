@@ -4,12 +4,11 @@
 #
 # format strings fill `{}` holes from the arguments in order, each rendered by
 # its type: signed/unsigned integers (8 to 128 bits) in decimal, str as text, ptr as
-# 0x-hex, f64 as the shortest round-trippable decimal. f32 widens to f64 (an
-# exact widening) and prints as that value, so an inexact f32 shows the full f64
-# expansion of its widened value; write_f32 writes f32's own shortest form.
-# bool and char share u8's
-# representation, so they render as their numeric value, a bool prints 1 or 0;
-# reach for the `{:c}` spec to render an integer's low byte as a character.
+# 0x-hex, and f64, f32 and f16 each as the shortest decimal that round-trips at
+# its own width, what write_f64, write_f32 and write_f16 write, so the f32
+# nearest 0.1 prints as `0.1`. bool and char share u8's representation, so they
+# render as their numeric value, a bool prints 1 or 0. reach for the `{:c}` spec
+# to render an integer's low byte as a character.
 #
 # a hole may carry a spec after `:`, a leading `<` to left-align (pad on the
 # right), `x`/`X` for lower/upper hex, `b` for binary, `c` for a low-byte char, a
@@ -1063,15 +1062,15 @@ fun fmt_i128(w: *writer.Writer, v: i128, sp: *Spec) res[usize, WriteError] {
     ret fmt_int(w, v::u128, false, sp);
 }
 
-# format a float in shortest round-trip decimal with width padding
-fun fmt_f64_field(w: *writer.Writer, v: f64, sp: *Spec) res[usize, WriteError] {
+# format a float of any ieee.Format row in shortest round-trip decimal with width padding
+fun fmt_float_field(w: *writer.Writer, fmt: ieee.Format, bits: u128, sp: *Spec) res[usize, WriteError] {
     var scratch: [64]u8;
     var s:       Span = Span{buf: ?scratch[0], len: 0, cap: 64};
     var bw:      writer.Writer;
     bw.ctx     = (?s)::ptr;
     bw.f_write = span_write;
 
-    val r: res[usize, WriteError] = write_f64(?bw, v);
+    val r: res[usize, WriteError] = write_float(?bw, fmt, bits);
     if (sel r.err) { ret r; }
     ret emit_field(w, ?scratch[0], s.len, sp);
 }
@@ -1118,7 +1117,7 @@ fun fmt_str_field(w: *writer.Writer, sv: str, sp: *Spec) res[usize, WriteError] 
 # format string
 #
 # the same type-directed dispatch as vformat's holes: signed/unsigned integers
-# in decimal, str as text, ptr as 0x-hex, f64 and f32 as the shortest
+# in decimal, str as text, ptr as 0x-hex, each float width as its own shortest
 # round-trippable decimal. each value of the pack is rendered in order with
 # nothing between them; the common call passes one. a type vformat would
 # refuse at runtime is refused here at instantiation, since the pack's types
@@ -1134,8 +1133,9 @@ pub fun write_value(w: *writer.Writer, va: ...) res[usize, WriteError] {
         var fr: res[usize, WriteError];
         $if ($type_of(arg) == str)  { fr = fmt_str_field(w, (arg::usize)::str, ?sp); }
         $or ($type_of(arg) == ptr)  { fr = fmt_ptr_field(w, (arg::usize)::ptr, ?sp); }
-        $or ($type_of(arg) == f64)  { fr = fmt_f64_field(w, arg::f64, ?sp); }
-        $or ($type_of(arg) == f32)  { fr = fmt_f64_field(w, arg::f64, ?sp); }
+        $or ($type_of(arg) == f64)  { fr = fmt_float_field(w, ieee.F64, f64_bits(arg::f64), ?sp); }
+        $or ($type_of(arg) == f32)  { fr = fmt_float_field(w, ieee.F32, f32_bits(arg::f32), ?sp); }
+        $or ($type_of(arg) == f16)  { fr = fmt_float_field(w, ieee.F16, f16_bits(arg::f16), ?sp); }
         $or ($type_of(arg) == i128) { fr = fmt_i128(w, arg::i128, ?sp); }
         $or ($type_of(arg) == i64)  { fr = fmt_i64(w, arg::i64, ?sp); }
         $or ($type_of(arg) == i32)  { fr = fmt_i64(w, arg::i64, ?sp); }
@@ -1156,7 +1156,8 @@ pub fun write_value(w: *writer.Writer, va: ...) res[usize, WriteError] {
 # format a comptime-variadic pack into a writer (v1.7 packs)
 #
 # holes are type-directed `{}` matched to args in order: signed/unsigned int ->
-# decimal, str -> text, ptr -> 0xHEX, f64 -> shortest round-trip decimal. specs:
+# decimal, str -> text, ptr -> 0xHEX, f64/f32/f16 -> shortest round-trip decimal
+# at its own width. specs:
 # `{:x}`/`{:X}` hex, `{:b}` binary, `{:c}` low-byte char, `{:N}`/`{:0N}` minimum
 # width (right-align), `{:<N}` left-align. `{{` and `}}` are literal-brace
 # escapes. the arg sequence is comptime-unrolled and monomorphized per call, so
@@ -1187,11 +1188,11 @@ pub fun vformat(w: *writer.Writer, fmt: str, va: ...) res[usize, FormatError] {
         # cast in the taken arm; the rest are pruned before they run. a type with
         # no rendering is refused at instantiation, since the pack's types are known.
         var fr: res[usize, WriteError];
-        $if ($type_of(arg) == str) { fr = fmt_str_field(w, (arg::usize)::str, ?sp); }
-        $or ($type_of(arg) == ptr) { fr = fmt_ptr_field(w, (arg::usize)::ptr, ?sp); }
-        $or ($type_of(arg) == f64) { fr = fmt_f64_field(w, arg::f64, ?sp); }
-        # f32 widens to f64 (exact) and prints as that value, as the header says.
-        $or ($type_of(arg) == f32)  { fr = fmt_f64_field(w, arg::f64, ?sp); }
+        $if ($type_of(arg) == str)  { fr = fmt_str_field(w, (arg::usize)::str, ?sp); }
+        $or ($type_of(arg) == ptr)  { fr = fmt_ptr_field(w, (arg::usize)::ptr, ?sp); }
+        $or ($type_of(arg) == f64)  { fr = fmt_float_field(w, ieee.F64, f64_bits(arg::f64), ?sp); }
+        $or ($type_of(arg) == f32)  { fr = fmt_float_field(w, ieee.F32, f32_bits(arg::f32), ?sp); }
+        $or ($type_of(arg) == f16)  { fr = fmt_float_field(w, ieee.F16, f16_bits(arg::f16), ?sp); }
         $or ($type_of(arg) == i128) { fr = fmt_i128(w, arg::i128, ?sp); }
         $or ($type_of(arg) == i64)  { fr = fmt_i64(w, arg::i64, ?sp); }
         $or ($type_of(arg) == i32)  { fr = fmt_i64(w, arg::i64, ?sp); }
@@ -1459,23 +1460,25 @@ $if (capability.HOSTED) {
         ret 0;
     }
 
-    # the `{}` f32 dispatch arm widens to f64 (exact) and formats that, so an f32
-    # renders as its f64 value. an exactly representable f32 is unaffected; an
-    # inexact one shows the full f64 expansion.
-    test format__f32_widens_to_f64 {
+    # `{}` and write_value render f32 and f16 at their own width. every expected
+    # digit string is numpy's shortest repr of the same binary32 or binary16
+    test format__f32_and_f16_shortest_at_own_width {
         var s: [64]u8;
 
-        if (!captured(fmt_capture(?s[0], 64, "{}", 0.5::f32), ?s[0], "0.5"))     { ret 1; }
-        if (!captured(fmt_capture(?s[0], 64, "{}", 1.25::f32), ?s[0], "1.25"))   { ret 2; }
-        if (!captured(fmt_capture(?s[0], 64, "{}", 2.0::f32), ?s[0], "2"))       { ret 3; }
-        if (!captured(fmt_capture(?s[0], 64, "{}", (-3.5)::f32), ?s[0], "-3.5")) { ret 4; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", as_f32(0x3DCCCCCD)), ?s[0], "0.1"))        { ret 1; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", as_f32(0x3EAAAAAB)), ?s[0], "0.33333334")) { ret 2; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", as_f32(0xC0600000)), ?s[0], "-3.5"))       { ret 3; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", as_f16(0x2E66)), ?s[0], "0.1"))            { ret 4; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", as_f16(0x3555)), ?s[0], "0.3333"))         { ret 5; }
 
-        # 0.1 is not exactly representable in f32; widening its value (bits
-        # 0x3DCCCCCD) to f64 yields the full expansion, not "0.1".
-        var x:    f32;
-        var bits: u32 = 0x3DCCCCCD;
-        memory.raw_copy(?x, ?bits, 4);
-        if (!captured(fmt_capture(?s[0], 64, "{}", x), ?s[0], "0.10000000149011612")) { ret 5; }
+        # width and alignment pad them as they pad f64
+        val padded: res[usize, FormatError] = fmt_capture(?s[0], 64, "{:6}|{:<7}|", as_f32(0x3DCCCCCD), as_f16(0x3555));
+        if (!captured(padded, ?s[0], "   0.1|0.3333 |")) { ret 6; }
+
+        var tb: TestBuf;
+        var w:  writer.Writer          = sink(?tb, ?s[0], 63);
+        val r:  res[usize, WriteError] = write_value(?w, as_f32(0x3DCCCCCD), as_f16(0x3555));
+        if (!wrote(r, ?tb, "0.10.3333")) { ret 7; }
         ret 0;
     }
 
