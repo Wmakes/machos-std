@@ -9,7 +9,6 @@ fwd std.types.size;
 fwd std.types.string;
 fwd std.types.view;
 fwd std.types.path;
-fwd std.types.semver;
 
 fwd std.collections.slice;
 fwd std.collections.vector;

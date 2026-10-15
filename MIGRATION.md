@@ -57,6 +57,15 @@ Every spawn and exec, in `std.process.exec` and `std.system.os` alike, takes the
 | `val e: **u8 = env.environ()` then `e[i]` | `val entries: Vector[env.Listed] = env.environ(a).ok` then `if (sel entries.data[i].variable) { ... }`, with `.unspellable` for an entry with no UTF-8 spelling |
 | `os.environ()` | `os.environ_native()`, or `env.environ(a)` for UTF-8 |
 
+## `types.semver` is removed (#1085)
+
+`std.types.semver` is removed, with `SemverError`, `semver_parse`, the predicates and `semver_compare`. Version handling is owned by mach, in its manifest version contract (`src/lang/manifest/version.mach`), which parses build metadata, refuses empty identifiers and leading zeros per SemVer 2.0.0, and compares numeric prerelease identifiers by length. std keeps no replacement, so code that parsed or compared versions through std should use mach's version handling or carry its own parser.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `use std.types.semver.semver_parse;`, `semver_parse(s, a)` | removed; version handling lives in mach |
+| `use std.types.semver.semver_compare;`, `semver_is_stable`, `semver_is_prerelease`, `semver_has_build` | removed; version handling lives in mach |
+
 # std 6.x to 7.0.0
 
 std 7.0.0 makes the memory behind `io.runtime` reachable (#677). A runtime takes the allocator every one of its allocations comes from, and every driver registered on it draws from the same allocator.

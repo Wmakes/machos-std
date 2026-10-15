@@ -61,7 +61,6 @@ std.types.error
 std.types.option
 std.types.path
 std.types.result
-std.types.semver
 std.types.size
 std.types.string
 std.types.view
