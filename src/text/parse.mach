@@ -14,7 +14,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 
-use std.math.bignum;
+use std.math.bignum.nat;
 use std.math.ieee;
 use std.memory;
 
@@ -363,49 +363,59 @@ pub fun parse_i64_exact(s: str, base: u8) res[i64, ParseError] {
     ret res[i64, ParseError].ok{u_val::i64};
 }
 
-# sign of (num/den - 2^p), comparing the rational num/den to 2^p
-fun cmp_ratio_pow2(num: *bignum.Big, den: *bignum.Big, p: i64) i64 {
-    var a: bignum.Big;
-    var b: bignum.Big;
-    bignum.copy(?a, num);
-    bignum.copy(?b, den);
-    if (p >= 0) { bignum.shl(?b, p::usize); }
-    or          { bignum.shl(?a, (0 - p)::usize); }
-    ret bignum.cmp(?a, ?b);
+# sign of (num/den - 2^p), comparing the rational num/den to 2^p in a and b
+fun cmp_ratio_pow2(num: *nat.Nat, den: *nat.Nat, p: i64, a: *nat.Nat, b: *nat.Nat) i64 {
+    nat.copy(a, num);
+    nat.copy(b, den);
+    if (p >= 0) { nat.shl(b, p::usize); }
+    or          { nat.shl(a, (0 - p)::usize); }
+    ret nat.cmp(a, b);
 }
 
-# nearest pattern of format f (sign excluded) to M * 10^D, ties to even
+# bignums a decimal parse holds at once, each of ieee.bignum_limbs limbs
+val PARSE_BIGNUMS: usize = 4;
+
+# the u32 words of work storage parse_float needs for format f
+# ---
+# f:   the format a parse rounds into
+# ret: the words, PARSE_BIGNUMS bignums of ieee.bignum_limbs(f) limbs
+pub fun parse_float_work(f: ieee.Format) usize {
+    ret PARSE_BIGNUMS * ieee.bignum_limbs(f);
+}
+
+# nearest pattern of format f (sign excluded) to num * 10^D, ties to even
 #
 # exact bignum arithmetic at f's own precision: the quotient is taken one bit
 # below the result's lsb and ieee.pack rounds it once, the remainder and any
 # digits the scan dropped (trunc) making the sticky bit. handles subnormals,
-# overflow to inf and underflow to zero.
-fun decimal_to_bits(f: ieee.Format, M: *bignum.Big, D: i64, trunc: bool) u128 {
-    if (bignum.is_zero(M)) { ret 0; }
+# overflow to inf and underflow to zero. num is consumed, and spare holds the
+# other three bignums, each of limbs limbs.
+fun decimal_to_bits(f: ieee.Format, num: *nat.Nat, D: i64, trunc: bool, spare: *u32, limbs: usize) u128 {
+    if (nat.is_zero(num)) { ret 0; }
 
     # out-of-range magnitudes short-circuit, which keeps the bignum bounded
-    val approx: i64 = D + (bignum.bitlen(M)::i64 * 1233) / 4096;
+    val approx: i64 = D + (nat.bitlen(num)::i64 * 1233) / 4096;
     if (approx > ieee.max_decimal_exp(f)) { ret ieee.inf_bits(f); }
     if (approx < ieee.min_decimal_exp(f)) { ret 0; }
 
-    # exact rational num/den = M * 10^D
-    var num: bignum.Big;
-    var den: bignum.Big;
-    bignum.copy(?num, M);
-    bignum.from_u64(?den, 1);
-    if (D >= 0) { bignum.mul_pow10(?num, D::usize); }
-    or          { bignum.mul_pow10(?den, (0 - D)::usize); }
+    # exact rational num/den, the value
+    var den: nat.Nat = nat.over(spare);
+    var a:   nat.Nat = nat.over(?spare[limbs]);
+    var b:   nat.Nat = nat.over(?spare[limbs * 2]);
+    nat.from_u64(?den, 1);
+    if (D >= 0) { nat.mul_pow10(num, D::usize); }
+    or          { nat.mul_pow10(?den, (0 - D)::usize); }
 
     # find e2 with 2^(e2+p-1) <= value < 2^(e2+p), the normal significand window
     val p:    i64  = ieee.precision(f);
-    var e2:   i64  = bignum.bitlen(?num)::i64 - bignum.bitlen(?den)::i64 - p;
+    var e2:   i64  = nat.bitlen(num)::i64 - nat.bitlen(?den)::i64 - p;
     var done: bool = false;
     for (!done) {
-        if (cmp_ratio_pow2(?num, ?den, e2 + p) >= 0) {
+        if (cmp_ratio_pow2(num, ?den, e2 + p, ?a, ?b) >= 0) {
             e2 = e2 + 1;
             cnt;
         }
-        if (cmp_ratio_pow2(?num, ?den, e2 + p - 1) < 0) {
+        if (cmp_ratio_pow2(num, ?den, e2 + p - 1, ?a, ?b) < 0) {
             e2 = e2 - 1;
             cnt;
         }
@@ -417,31 +427,25 @@ fun decimal_to_bits(f: ieee.Format, M: *bignum.Big, D: i64, trunc: bool) u128 {
     if (lsb < ieee.min_lsb(f)) { lsb = ieee.min_lsb(f); }
     val at: i64 = lsb - 1;
 
-    # nn/dd = value / 2^at
-    var nn: bignum.Big;
-    var dd: bignum.Big;
-    bignum.copy(?nn, ?num);
-    bignum.copy(?dd, ?den);
-    if (at >= 0) { bignum.shl(?dd, at::usize); }
-    or           { bignum.shl(?nn, (0 - at)::usize); }
+    # num/den = value / 2^at
+    if (at >= 0) { nat.shl(?den, at::usize); }
+    or           { nat.shl(num, (0 - at)::usize); }
 
-    # q = floor(nn / dd) by binary long division, under 2^(p+1) by the window
+    # q = floor(num / den) by binary long division, under 2^(p+1) by the window,
+    # leaving the remainder in num
     var q:   u128 = 0;
-    var rem: bignum.Big;
-    bignum.copy(?rem, ?nn);
-    var b: i64 = p + 1;
-    for (b >= 0) {
-        var t: bignum.Big;
-        bignum.copy(?t, ?dd);
-        bignum.shl(?t, b::usize);
-        if (bignum.cmp(?rem, ?t) >= 0) {
-            bignum.sub(?rem, ?t);
-            q = q | (1::u128 << b::u128);
+    var bit: i64  = p + 1;
+    for (bit >= 0) {
+        nat.copy(?a, ?den);
+        nat.shl(?a, bit::usize);
+        if (nat.cmp(num, ?a) >= 0) {
+            nat.sub(num, ?a);
+            q = q | (1::u128 << bit::u128);
         }
-        b = b - 1;
+        bit = bit - 1;
     }
 
-    ret ieee.pack(f, false, q, at, trunc || !bignum.is_zero(?rem));
+    ret ieee.pack(f, false, q, at, trunc || !nat.is_zero(num));
 }
 
 # scan integer + fractional digits from s at @i into M
@@ -451,8 +455,8 @@ fun decimal_to_bits(f: ieee.Format, M: *bignum.Big, D: i64, trunc: bool) u128 {
 # nonzero (out_trunc). advances @i and writes the decimal-exponent contribution
 # to @out_dexp (value-so-far = M * 10^out_dexp). returns true iff at least one
 # digit was seen.
-fun collect_significand(s: str, len: usize, i: *usize, M: *bignum.Big, out_dexp: *i64, out_trunc: *bool, maxsig: i64) bool {
-    bignum.from_u64(M, 0);
+fun collect_significand(s: str, len: usize, i: *usize, M: *nat.Nat, out_dexp: *i64, out_trunc: *bool, maxsig: i64) bool {
+    nat.zero(M);
     var sig:       i64  = 0;
     var dexp:      i64  = 0;
     var seen:      bool = false;
@@ -466,9 +470,9 @@ fun collect_significand(s: str, len: usize, i: *usize, M: *bignum.Big, out_dexp:
         if (c < '0' || c > '9') { brk; }
         seen = true;
         if (sig < maxsig) {
-            bignum.mul_small(M, 10);
-            bignum.add_small(M, (c - '0')::u32);
-            if (!bignum.is_zero(M)) { sig = sig + 1; }
+            nat.mul_small(M, 10);
+            nat.add_small(M, (c - '0')::u32);
+            if (!nat.is_zero(M)) { sig = sig + 1; }
         }
         or {
             dexp = dexp + 1;
@@ -487,9 +491,9 @@ fun collect_significand(s: str, len: usize, i: *usize, M: *bignum.Big, out_dexp:
             if (c < '0' || c > '9') { brk; }
             seen = true;
             if (sig < maxsig) {
-                bignum.mul_small(M, 10);
-                bignum.add_small(M, (c - '0')::u32);
-                if (!bignum.is_zero(M)) { sig = sig + 1; }
+                nat.mul_small(M, 10);
+                nat.add_small(M, (c - '0')::u32);
+                if (!nat.is_zero(M)) { sig = sig + 1; }
                 dexp = dexp - 1;
             }
             or {
@@ -628,8 +632,10 @@ fun hex_stop(s: str, len: usize, i: usize) usize {
 # whole: require the span be the number exactly, with no leading whitespace or
 #        trailing byte; otherwise skip leading whitespace and stop at the first
 #        byte that is not part of a float
+# work:  storage of parse_float_work(f) u32 words a decimal parse works in; a
+#        hex parse never touches it
 # ret:   the pattern in the low end, or the failure
-pub fun parse_float(f: ieee.Format, radix: Radix, s: str, len: usize, whole: bool) res[u128, ParseError] {
+pub fun parse_float(f: ieee.Format, radix: Radix, s: str, len: usize, whole: bool, work: *u32) res[u128, ParseError] {
     if (len == 0) { ret res[u128, ParseError].err{ParseError.empty{}}; }
 
     var i: usize = 0;
@@ -670,9 +676,10 @@ pub fun parse_float(f: ieee.Format, radix: Radix, s: str, len: usize, whole: boo
         bits = h.ok;
     }
     or {
-        var M:     bignum.Big;
-        var dexp:  i64  = 0;
-        var trunc: bool = false;
+        val limbs: usize   = ieee.bignum_limbs(f);
+        var M:     nat.Nat = nat.over(work);
+        var dexp:  i64     = 0;
+        var trunc: bool    = false;
         if (!collect_significand(s, len, ?i, ?M, ?dexp, ?trunc, ieee.max_sig_digits(f))) {
             ret res[u128, ParseError].err{ParseError.syntax{i}};
         }
@@ -681,11 +688,22 @@ pub fun parse_float(f: ieee.Format, radix: Radix, s: str, len: usize, whole: boo
             i = i + 1;
             if (!scan_exp(s, len, ?i, ?exp)) { ret res[u128, ParseError].err{ParseError.syntax{i}}; }
         }
-        bits = sign | decimal_to_bits(f, ?M, dexp + exp, trunc);
+        bits = sign | decimal_to_bits(f, ?M, dexp + exp, trunc, ?work[limbs], limbs);
     }
 
     if (whole && i != len) { ret res[u128, ParseError].err{ParseError.syntax{i}}; }
     ret res[u128, ParseError].ok{bits};
+}
+
+# each row's parse storage, as a stack type
+def F16_WORK: [PARSE_BIGNUMS * ieee.F16_LIMBS]u32;
+def F32_WORK: [PARSE_BIGNUMS * ieee.F32_LIMBS]u32;
+def F64_WORK: [PARSE_BIGNUMS * ieee.F64_LIMBS]u32;
+
+# a decimal parse of f in stack storage of type W, a u32 array sized for f
+fun decimal_in[W](f: ieee.Format, s: str, len: usize, whole: bool) res[u128, ParseError] {
+    var work: W;
+    ret parse_float(f, Radix.decimal{}, s, len, whole, (?work)::*u32);
 }
 
 # the f64 a binary64 parse names
@@ -739,7 +757,7 @@ pub fun parse_f64(s: str) res[f64, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f64_len(s: str, len: usize) res[f64, ParseError] {
-    ret as_f64(parse_float(ieee.F64, Radix.decimal{}, s, len, false));
+    ret as_f64(decimal_in[F64_WORK](ieee.F64, s, len, false));
 }
 
 # parse a 64-bit floating point number from a string, requiring full consumption
@@ -751,7 +769,7 @@ pub fun parse_f64_len(s: str, len: usize) res[f64, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f64_exact(s: str) res[f64, ParseError] {
-    ret as_f64(parse_float(ieee.F64, Radix.decimal{}, s, str_len(s), true));
+    ret as_f64(decimal_in[F64_WORK](ieee.F64, s, str_len(s), true));
 }
 
 # parse a 32-bit floating point number prefix from a string
@@ -771,7 +789,7 @@ pub fun parse_f32(s: str) res[f32, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f32_len(s: str, len: usize) res[f32, ParseError] {
-    ret as_f32(parse_float(ieee.F32, Radix.decimal{}, s, len, false));
+    ret as_f32(decimal_in[F32_WORK](ieee.F32, s, len, false));
 }
 
 # parse a 32-bit floating point number from a string, requiring full consumption
@@ -779,7 +797,7 @@ pub fun parse_f32_len(s: str, len: usize) res[f32, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f32_exact(s: str) res[f32, ParseError] {
-    ret as_f32(parse_float(ieee.F32, Radix.decimal{}, s, str_len(s), true));
+    ret as_f32(decimal_in[F32_WORK](ieee.F32, s, str_len(s), true));
 }
 
 # parse a 16-bit floating point number prefix from a string
@@ -799,7 +817,7 @@ pub fun parse_f16(s: str) res[f16, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f16_len(s: str, len: usize) res[f16, ParseError] {
-    ret as_f16(parse_float(ieee.F16, Radix.decimal{}, s, len, false));
+    ret as_f16(decimal_in[F16_WORK](ieee.F16, s, len, false));
 }
 
 # parse a 16-bit floating point number from a string, requiring full consumption
@@ -807,7 +825,7 @@ pub fun parse_f16_len(s: str, len: usize) res[f16, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f16_exact(s: str) res[f16, ParseError] {
-    ret as_f16(parse_float(ieee.F16, Radix.decimal{}, s, str_len(s), true));
+    ret as_f16(decimal_in[F16_WORK](ieee.F16, s, str_len(s), true));
 }
 
 # parse a 64-bit C99 hex float prefix from a string
@@ -828,7 +846,7 @@ pub fun parse_f64_hex(s: str) res[f64, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f64_hex_len(s: str, len: usize) res[f64, ParseError] {
-    ret as_f64(parse_float(ieee.F64, Radix.hex{}, s, len, false));
+    ret as_f64(parse_float(ieee.F64, Radix.hex{}, s, len, false, nil));
 }
 
 # parse a 64-bit C99 hex float from a string, requiring full consumption
@@ -836,7 +854,7 @@ pub fun parse_f64_hex_len(s: str, len: usize) res[f64, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f64_hex_exact(s: str) res[f64, ParseError] {
-    ret as_f64(parse_float(ieee.F64, Radix.hex{}, s, str_len(s), true));
+    ret as_f64(parse_float(ieee.F64, Radix.hex{}, s, str_len(s), true, nil));
 }
 
 # parse a 32-bit C99 hex float prefix from a string
@@ -857,7 +875,7 @@ pub fun parse_f32_hex(s: str) res[f32, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f32_hex_len(s: str, len: usize) res[f32, ParseError] {
-    ret as_f32(parse_float(ieee.F32, Radix.hex{}, s, len, false));
+    ret as_f32(parse_float(ieee.F32, Radix.hex{}, s, len, false, nil));
 }
 
 # parse a 32-bit C99 hex float from a string, requiring full consumption
@@ -865,7 +883,7 @@ pub fun parse_f32_hex_len(s: str, len: usize) res[f32, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f32_hex_exact(s: str) res[f32, ParseError] {
-    ret as_f32(parse_float(ieee.F32, Radix.hex{}, s, str_len(s), true));
+    ret as_f32(parse_float(ieee.F32, Radix.hex{}, s, str_len(s), true, nil));
 }
 
 # parse a 16-bit C99 hex float prefix from a string
@@ -886,7 +904,7 @@ pub fun parse_f16_hex(s: str) res[f16, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f16_hex_len(s: str, len: usize) res[f16, ParseError] {
-    ret as_f16(parse_float(ieee.F16, Radix.hex{}, s, len, false));
+    ret as_f16(parse_float(ieee.F16, Radix.hex{}, s, len, false, nil));
 }
 
 # parse a 16-bit C99 hex float from a string, requiring full consumption
@@ -894,7 +912,7 @@ pub fun parse_f16_hex_len(s: str, len: usize) res[f16, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f16_hex_exact(s: str) res[f16, ParseError] {
-    ret as_f16(parse_float(ieee.F16, Radix.hex{}, s, str_len(s), true));
+    ret as_f16(parse_float(ieee.F16, Radix.hex{}, s, str_len(s), true, nil));
 }
 
 # whether parse_u64(s, base) succeeds with want
@@ -1473,18 +1491,95 @@ test parse_float__decimal_parsers_never_read_hex {
 # keeps 8 bits, so 1 + 2^-8 is a tie to 1 and 1 + 3 * 2^-8 a tie up, and 2^-133
 # is its smallest subnormal
 test parse_float__a_new_row_is_data_only {
-    val bf16: ieee.Format           = ieee.Format{mant_bits: 7, exp_bits: 8, bias: 127};
-    val a:    res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "1.00390625", 10, true);
+    var work: [PARSE_BIGNUMS * ieee.BF16_LIMBS]u32;
+    val bf16: ieee.Format           = ieee.BF16;
+    val a:    res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "1.00390625", 10, true, ?work[0]);
     if (sel a.err)      { ret 1; }
     if (a.ok != 0x3F80) { ret 1; }
-    val b: res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "1.01171875", 10, true);
+    val b: res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "1.01171875", 10, true, ?work[0]);
     if (sel b.err)      { ret 2; }
     if (b.ok != 0x3F82) { ret 2; }
-    val c: res[u128, ParseError] = parse_float(bf16, Radix.hex{}, "0x1p-133", 8, true);
+    val c: res[u128, ParseError] = parse_float(bf16, Radix.hex{}, "0x1p-133", 8, true, ?work[0]);
     if (sel c.err)      { ret 3; }
     if (c.ok != 0x0001) { ret 3; }
-    val d: res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "-3.0e38", 7, true);
-    if (sel d.err)      { ret 4; }
-    if (d.ok != 0xFF62) { ret 4; }
+    val d: res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "-3.0e38", 7, true, ?work[0]);
+    if (sel d.err)                                                 { ret 4; }
+    if (d.ok != 0xFF62)                                            { ret 4; }
+    if (parse_float_work(bf16) != PARSE_BIGNUMS * ieee.BF16_LIMBS) { ret 5; }
+    ret 0;
+}
+
+# each row's stack storage is exactly what parse_float asks for
+test parse_float__every_row_sizes_its_storage {
+    if (parse_float_work(ieee.F16) != $length_of(F16_WORK)) { ret 1; }
+    if (parse_float_work(ieee.F32) != $length_of(F32_WORK)) { ret 2; }
+    if (parse_float_work(ieee.F64) != $length_of(F64_WORK)) { ret 3; }
+    ret 0;
+}
+
+# the binary128 pattern hi:lo
+#[testing]
+fun b128(hi: u64, lo: u64) u128 {
+    ret (hi::u128 << 64) | lo::u128;
+}
+
+# whether all of s parses as binary128 to want, in storage sized for that row
+#[testing]
+fun q128_is(radix: Radix, s: str, want: u128) bool {
+    var work: [PARSE_BIGNUMS * ieee.F128_LIMBS]u32;
+    val r:    res[u128, ParseError] = parse_float(ieee.F128, radix, s, str_len(s), true, ?work[0]);
+    ret sel r.ok && r.ok == want;
+}
+
+# binary128, a row no parse was written for, at every rounding edge. each
+# expected pattern is libquadmath's strtoflt128 of the same literal, and each
+# literal near an edge is that edge's exact value rounded to 40 digits
+test parse_float__binary128_rounds_at_every_edge {
+    val dec: Radix = Radix.decimal{};
+    val hex: Radix = Radix.hex{};
+    if (parse_float_work(ieee.F128) != PARSE_BIGNUMS * ieee.F128_LIMBS) { ret 1; }
+    # 1 + 2^-113 and 1 + 3 * 2^-113, exact midpoints: even is down, then up
+    if (!q128_is(dec, "1.00000000000000000000000000000000009629649721936179265279889712924636592690508241076940976199693977832794189453125", b128(0x3FFF000000000000, 0)))  { ret 2; }
+    if (!q128_is(dec, "1.00000000000000000000000000000000028888949165808537795839669138773909778071524723230822928599081933498382568359375", b128(0x3FFF000000000000, 2)))  { ret 3; }
+    if (!q128_is(dec, "-1.00000000000000000000000000000000009629649721936179265279889712924636592690508241076940976199693977832794189453125", b128(0xBFFF000000000000, 0))) { ret 4; }
+    # half the smallest subnormal 2^-16495: just above is 2^-16494, just below zero
+    if (!q128_is(dec, "3.237587559719012555462219479113823276250e-4966", b128(0, 1))) { ret 5; }
+    if (!q128_is(dec, "3.237587559719012555462219479113823276249e-4966", b128(0, 0))) { ret 6; }
+    if (!q128_is(dec, "6.475175119438025110924438958227646552e-4966", b128(0, 1)))    { ret 7; }
+    # the exact ties there, 2^-16495 and 3 * 2^-16495, go to even
+    if (!q128_is(hex, "0x1p-16495", b128(0, 0))) { ret 8; }
+    if (!q128_is(hex, "0x3p-16495", b128(0, 2))) { ret 8; }
+    # the largest subnormal, then just past its midpoint with 2^-16382
+    if (!q128_is(hex, "0x0.ffffffffffffffffffffffffffffp-16382", b128(0x0000FFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF))) { ret 9; }
+    if (!q128_is(dec, "3.362103143112093506262677817321752278840e-4932", b128(0x0001000000000000, 0)))          { ret 10; }
+    if (!q128_is(dec, "3.36210314311209350626267781732175260e-4932", b128(0x0001000000000000, 0)))              { ret 11; }
+    # the largest finite, then either side of its midpoint with 2^16384
+    if (!q128_is(dec, "1.18973149535723176508575932662800702e4932", b128(0x7FFEFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF)))     { ret 12; }
+    if (!q128_is(dec, "1.189731495357231765085759326628007073479e4932", b128(0x7FFEFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF))) { ret 13; }
+    if (!q128_is(dec, "1.189731495357231765085759326628007073480e4932", b128(0x7FFF000000000000, 0)))                  { ret 14; }
+    # the exact tie there goes to even, which is inf
+    if (!q128_is(hex, "0x1.ffffffffffffffffffffffffffff8p16383", b128(0x7FFF000000000000, 0)))                      { ret 15; }
+    if (!q128_is(hex, "-0x1.ffffffffffffffffffffffffffff7fffp16383", b128(0xFFFEFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF))) { ret 16; }
+    if (!q128_is(dec, "0.1", b128(0x3FFB999999999999, 0x999999999999999A)))                                         { ret 17; }
+    ret 0;
+}
+
+# the 1 + 2^-113 midpoint, then zeros past binary128's 11565 deciding digits and
+# a final 1: strictly above the midpoint, so up, which only the sticky bit sees
+test parse_float__binary128_truncation_keeps_the_sticky_bit {
+    var buf:    [12160]u8;
+    val prefix: str   = "1.00000000000000000000000000000000009629649721936179265279889712924636592690508241076940976199693977832794189453125";
+    var n:      usize = 0;
+    for (prefix[n] != 0) {
+        buf[n] = prefix[n];
+        n      = n + 1;
+    }
+    for (n < 12150) {
+        buf[n] = '0';
+        n      = n + 1;
+    }
+    buf[n]     = '1';
+    buf[n + 1] = 0;
+    if (!q128_is(Radix.decimal{}, ?buf[0], b128(0x3FFF000000000000, 1))) { ret 1; }
     ret 0;
 }
