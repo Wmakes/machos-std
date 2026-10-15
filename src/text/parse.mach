@@ -15,6 +15,7 @@ use std.types.string.str;
 use std.types.string.str_len;
 
 use std.math.bignum;
+use std.math.ieee;
 use std.memory;
 
 # every way a number parse can fail
@@ -373,18 +374,21 @@ fun cmp_ratio_pow2(num: *bignum.Big, den: *bignum.Big, p: i64) i64 {
     ret bignum.cmp(?a, ?b);
 }
 
-# nearest f64 bit pattern (sign excluded) to M * 10^D, round-to-
-# nearest-even, via exact bignum arithmetic. M is non-negative; the caller ORs in
-# the sign bit. handles subnormals, overflow (-> inf), and underflow (-> 0).
-fun decimal_to_f64(M: *bignum.Big, D: i64, trunc: bool) u64 {
+# nearest pattern of format f (sign excluded) to M * 10^D, ties to even
+#
+# exact bignum arithmetic at f's own precision: the quotient is taken one bit
+# below the result's lsb and ieee.pack rounds it once, the remainder and any
+# digits the scan dropped (trunc) making the sticky bit. handles subnormals,
+# overflow to inf and underflow to zero.
+fun decimal_to_bits(f: ieee.Format, M: *bignum.Big, D: i64, trunc: bool) u128 {
     if (bignum.is_zero(M)) { ret 0; }
 
-    # short-circuit clearly out-of-range magnitudes (keeps the bignum bounded).
+    # out-of-range magnitudes short-circuit, which keeps the bignum bounded
     val approx: i64 = D + (bignum.bitlen(M)::i64 * 1233) / 4096;
-    if (approx > 320)  { ret 0x7FF0000000000000; }
-    if (approx < -340) { ret 0; }
+    if (approx > ieee.max_decimal_exp(f)) { ret ieee.inf_bits(f); }
+    if (approx < ieee.min_decimal_exp(f)) { ret 0; }
 
-    # exact rational num/den = M * 10^D.
+    # exact rational num/den = M * 10^D
     var num: bignum.Big;
     var den: bignum.Big;
     bignum.copy(?num, M);
@@ -392,89 +396,67 @@ fun decimal_to_f64(M: *bignum.Big, D: i64, trunc: bool) u64 {
     if (D >= 0) { bignum.mul_pow10(?num, D::usize); }
     or          { bignum.mul_pow10(?den, (0 - D)::usize); }
 
-    # find e2 with 2^(e2+52) <= value < 2^(e2+53) (53-bit normal mantissa window).
-    var e2:   i64  = bignum.bitlen(?num)::i64 - bignum.bitlen(?den)::i64 - 53;
+    # find e2 with 2^(e2+p-1) <= value < 2^(e2+p), the normal significand window
+    val p:    i64  = ieee.precision(f);
+    var e2:   i64  = bignum.bitlen(?num)::i64 - bignum.bitlen(?den)::i64 - p;
     var done: bool = false;
     for (!done) {
-        if (cmp_ratio_pow2(?num, ?den, e2 + 53) >= 0) {
+        if (cmp_ratio_pow2(?num, ?den, e2 + p) >= 0) {
             e2 = e2 + 1;
             cnt;
         }
-        if (cmp_ratio_pow2(?num, ?den, e2 + 52) < 0) {
+        if (cmp_ratio_pow2(?num, ?den, e2 + p - 1) < 0) {
             e2 = e2 - 1;
             cnt;
         }
         done = true;
     }
 
-    # clamp the mantissa LSB to the subnormal floor (2^-1074), a single rounding.
+    # the lsb clamps at the subnormal floor; the quotient keeps one bit below it
     var lsb: i64 = e2;
-    if (lsb < -1074) { lsb = -1074; }
+    if (lsb < ieee.min_lsb(f)) { lsb = ieee.min_lsb(f); }
+    val at: i64 = lsb - 1;
 
-    # nn/dd = value / 2^lsb.
+    # nn/dd = value / 2^at
     var nn: bignum.Big;
     var dd: bignum.Big;
     bignum.copy(?nn, ?num);
     bignum.copy(?dd, ?den);
-    if (lsb >= 0) { bignum.shl(?dd, lsb::usize); }
-    or            { bignum.shl(?nn, (0 - lsb)::usize); }
+    if (at >= 0) { bignum.shl(?dd, at::usize); }
+    or           { bignum.shl(?nn, (0 - at)::usize); }
 
-    # q = floor(nn / dd) via binary long division; remainder left in rem.
-    var q:   u64 = 0;
+    # q = floor(nn / dd) by binary long division, under 2^(p+1) by the window
+    var q:   u128 = 0;
     var rem: bignum.Big;
     bignum.copy(?rem, ?nn);
-    var b: i64 = 53;
+    var b: i64 = p + 1;
     for (b >= 0) {
         var t: bignum.Big;
         bignum.copy(?t, ?dd);
         bignum.shl(?t, b::usize);
         if (bignum.cmp(?rem, ?t) >= 0) {
             bignum.sub(?rem, ?t);
-            q = q | (1::u64 << b::usize);
+            q = q | (1::u128 << b::u128);
         }
         b = b - 1;
     }
 
-    # round-to-nearest-even using 2*rem vs dd.
-    var rem2: bignum.Big;
-    bignum.copy(?rem2, ?rem);
-    bignum.shl(?rem2, 1);
-    val c: i64 = bignum.cmp(?rem2, ?dd);
-    if (c > 0) { q = q + 1; }
-    or (c == 0) {
-        # M*10^D sits exactly on the midpoint: dropped nonzero digits (trunc)
-        # push the true value above it, so round up instead of to-even.
-        if (trunc) { q = q + 1; }
-        or {
-            if ((q & 1) == 1) { q = q + 1; }
-        }
-    }
-
-    if (lsb == -1074) {
-        # subnormal regime (and the smallest normals): the bit pattern is q itself.
-        ret q;
-    }
-    var biased: i64 = e2 + 1075;
-    if (q == 0x20000000000000) {
-        q      = 0x10000000000000;
-        biased = biased + 1;
-    }
-    if (biased >= 2047) { ret 0x7FF0000000000000; }
-    ret (biased::u64 << 52) | (q & 0xFFFFFFFFFFFFF);
+    ret ieee.pack(f, false, q, at, trunc || !bignum.is_zero(?rem));
 }
 
 # scan integer + fractional digits from s at @i into M
-# (capped at 768 significant digits, well past what f64 rounding can use, so
-# excess digits are dropped without affecting the result). advances @i and writes
-# the decimal-exponent contribution to @out_dexp (value-so-far = M * 10^out_dexp).
-# returns true iff at least one digit was seen.
-fun collect_significand(s: str, len: usize, i: *usize, M: *bignum.Big, out_dexp: *i64, out_trunc: *bool) bool {
+#
+# keeps at most maxsig significant digits, past which no digit can change a
+# rounding of the target format; the dropped digits only report whether any was
+# nonzero (out_trunc). advances @i and writes the decimal-exponent contribution
+# to @out_dexp (value-so-far = M * 10^out_dexp). returns true iff at least one
+# digit was seen.
+fun collect_significand(s: str, len: usize, i: *usize, M: *bignum.Big, out_dexp: *i64, out_trunc: *bool, maxsig: i64) bool {
     bignum.from_u64(M, 0);
     var sig:       i64  = 0;
     var dexp:      i64  = 0;
     var seen:      bool = false;
     var truncated: bool = false;
-    val MAXSIG:    i64  = 768;
     for (@i < len) {
         val c: u8 = s[@i];
         if (c == '_') {
@@ -483,7 +465,7 @@ fun collect_significand(s: str, len: usize, i: *usize, M: *bignum.Big, out_dexp:
         }
         if (c < '0' || c > '9') { brk; }
         seen = true;
-        if (sig < MAXSIG) {
+        if (sig < maxsig) {
             bignum.mul_small(M, 10);
             bignum.add_small(M, (c - '0')::u32);
             if (!bignum.is_zero(M)) { sig = sig + 1; }
@@ -504,7 +486,7 @@ fun collect_significand(s: str, len: usize, i: *usize, M: *bignum.Big, out_dexp:
             }
             if (c < '0' || c > '9') { brk; }
             seen = true;
-            if (sig < MAXSIG) {
+            if (sig < maxsig) {
                 bignum.mul_small(M, 10);
                 bignum.add_small(M, (c - '0')::u32);
                 if (!bignum.is_zero(M)) { sig = sig + 1; }
@@ -521,9 +503,224 @@ fun collect_significand(s: str, len: usize, i: *usize, M: *bignum.Big, out_dexp:
     ret seen;
 }
 
-# stops at the first character that is not part of a valid float. use
-# parse_f64_exact to require full input consumption, or parse_f64_len for a span
-# that is not null-terminated.
+# exponents saturate here, far past where every format is inf or zero
+val EXP_LIMIT: i64 = 1000000000;
+
+# scan an optionally signed decimal exponent at @i into @out
+#
+# saturates at EXP_LIMIT so a huge exponent cannot wrap. returns false when no
+# digit follows, leaving @i at the offending byte.
+fun scan_exp(s: str, len: usize, i: *usize, out: *i64) bool {
+    var sign: i64 = 1;
+    if (@i < len && s[@i] == '+') { @i = @i + 1; }
+    or (@i < len && s[@i] == '-') {
+        sign = -1;
+        @i   = @i + 1;
+    }
+    var e:    i64  = 0;
+    var seen: bool = false;
+    for (@i < len) {
+        val c: u8 = s[@i];
+        if (c == '_') {
+            @i = @i + 1;
+            cnt;
+        }
+        if (c < '0' || c > '9') { brk; }
+        seen = true;
+        if (e < EXP_LIMIT) { e = e * 10 + (c - '0')::u64::i64; }
+        @i = @i + 1;
+    }
+    @out = e * sign;
+    ret seen;
+}
+
+# the value of a hex digit, or -1
+fun hex_digit(c: u8) i32 {
+    val d: i32 = char_digit_val(c);
+    if (d >= 16) { ret -1; }
+    ret d;
+}
+
+# whether s at i opens a hex float: 0x or 0X then a hex digit, or a point and one
+fun hex_opens(s: str, len: usize, i: usize) bool {
+    if (i + 2 >= len || s[i] != '0' || (s[i + 1] != 'x' && s[i + 1] != 'X')) { ret false; }
+    if (hex_digit(s[i + 2]) >= 0)                                            { ret true; }
+    ret s[i + 2] == '.' && i + 3 < len && hex_digit(s[i + 3]) >= 0;
+}
+
+# scan a hex significand and optional binary exponent at @i, rounding into f
+#
+# the significand gathers exactly while it has room for 124 bits, more than any
+# row's precision; later digits only scale it or mark the sticky bit, so
+# ieee.pack rounds the whole literal once.
+fun scan_hex(f: ieee.Format, s: str, len: usize, i: *usize, neg: bool) res[u128, ParseError] {
+    var acc:    u128 = 0;
+    var exp:    i64  = 0;
+    var sticky: bool = false;
+    var point:  bool = false;
+    for (@i < len) {
+        val c: u8 = s[@i];
+        if (c == '_') {
+            @i = @i + 1;
+            cnt;
+        }
+        if (c == '.' && !point) {
+            point = true;
+            @i    = @i + 1;
+            cnt;
+        }
+        val d: i32 = hex_digit(c);
+        if (d < 0) { brk; }
+        if ((acc >> 124) == 0) {
+            acc = (acc << 4) | (d::u8)::u128;
+            if (point) { exp = exp - 4; }
+        }
+        or {
+            if (d != 0) { sticky = true; }
+            if (!point) { exp = exp + 4; }
+        }
+        @i = @i + 1;
+    }
+    if (@i < len && (s[@i] == 'p' || s[@i] == 'P')) {
+        @i = @i + 1;
+        var e: i64 = 0;
+        if (!scan_exp(s, len, i, ?e)) { ret res[u128, ParseError].err{ParseError.syntax{@i}}; }
+        exp = exp + e;
+    }
+    ret res[u128, ParseError].ok{ieee.pack(f, neg, acc, exp, sticky)};
+}
+
+# which literal form a float parse reads
+# ---
+# decimal: digits with an optional point and an optional `e` exponent
+# hex:     a C99 hex float, `0x` or `0X` then hex digits with an optional point
+#          and an optional `p` exponent
+pub tag Radix: u8 {
+    decimal;
+    hex;
+}
+
+# the offset where s at i stops being `0x` then a hex digit or a point and one
+fun hex_stop(s: str, len: usize, i: usize) usize {
+    var j: usize = i;
+    if (j < len && s[j] == '0') {
+        j = j + 1;
+        if (j < len && (s[j] == 'x' || s[j] == 'X')) {
+            j = j + 1;
+            if (j < len && s[j] == '.') { j = j + 1; }
+        }
+    }
+    ret j;
+}
+
+# parse a float of any ieee.Format row from the first `len` bytes of `s`
+#
+# the one parse every width and radix runs. accepts an optional sign, then `inf`,
+# `nan`, or a literal of the given radix, with `_` separators between digits.
+# both radices round to nearest, ties to even, at the format's own precision,
+# into the subnormal range and to inf. a sign before `nan` is ignored. a decimal
+# parse never reads hex: `0x1p3` is the decimal 0 followed by a stray `x`.
+# ---
+# f:     the format to round into
+# radix: the literal form to read
+# s:     the bytes to parse
+# len:   the number of bytes available in s
+# whole: require the span be the number exactly, with no leading whitespace or
+#        trailing byte; otherwise skip leading whitespace and stop at the first
+#        byte that is not part of a float
+# ret:   the pattern in the low end, or the failure
+pub fun parse_float(f: ieee.Format, radix: Radix, s: str, len: usize, whole: bool) res[u128, ParseError] {
+    if (len == 0) { ret res[u128, ParseError].err{ParseError.empty{}}; }
+
+    var i: usize = 0;
+    if (!whole) {
+        for (i < len && char_is_space(s[i])) {
+            i = i + 1;
+        }
+        if (i >= len) { ret res[u128, ParseError].err{ParseError.empty{}}; }
+    }
+
+    var neg: bool = false;
+    if (s[i] == '-') {
+        neg = true;
+        i   = i + 1;
+    }
+    or (s[i] == '+') { i = i + 1; }
+
+    if (i >= len) { ret res[u128, ParseError].err{ParseError.syntax{i}}; }
+
+    var sign: u128 = 0;
+    if (neg) { sign = ieee.sign_bit(f); }
+
+    if (i + 3 <= len && s[i] == 'i' && s[i + 1] == 'n' && s[i + 2] == 'f') {
+        if (whole && i + 3 != len) { ret res[u128, ParseError].err{ParseError.syntax{i}}; }
+        ret res[u128, ParseError].ok{sign | ieee.inf_bits(f)};
+    }
+    if (i + 3 <= len && s[i] == 'n' && s[i + 1] == 'a' && s[i + 2] == 'n') {
+        if (whole && i + 3 != len) { ret res[u128, ParseError].err{ParseError.syntax{i}}; }
+        ret res[u128, ParseError].ok{ieee.nan_bits(f)};
+    }
+
+    var bits: u128 = 0;
+    if (sel radix.hex) {
+        if (!hex_opens(s, len, i)) { ret res[u128, ParseError].err{ParseError.syntax{hex_stop(s, len, i)}}; }
+        i = i + 2;
+        val h: res[u128, ParseError] = scan_hex(f, s, len, ?i, neg);
+        if (sel h.err) { ret h; }
+        bits = h.ok;
+    }
+    or {
+        var M:     bignum.Big;
+        var dexp:  i64  = 0;
+        var trunc: bool = false;
+        if (!collect_significand(s, len, ?i, ?M, ?dexp, ?trunc, ieee.max_sig_digits(f))) {
+            ret res[u128, ParseError].err{ParseError.syntax{i}};
+        }
+        var exp: i64 = 0;
+        if (i < len && (s[i] == 'e' || s[i] == 'E')) {
+            i = i + 1;
+            if (!scan_exp(s, len, ?i, ?exp)) { ret res[u128, ParseError].err{ParseError.syntax{i}}; }
+        }
+        bits = sign | decimal_to_bits(f, ?M, dexp + exp, trunc);
+    }
+
+    if (whole && i != len) { ret res[u128, ParseError].err{ParseError.syntax{i}}; }
+    ret res[u128, ParseError].ok{bits};
+}
+
+# the f64 a binary64 parse names
+fun as_f64(r: res[u128, ParseError]) res[f64, ParseError] {
+    if (sel r.err) { ret res[f64, ParseError].err{r.err}; }
+    val bits: u64 = r.ok::u64;
+    var v:    f64;
+    memory.raw_copy(?v, ?bits, 8);
+    ret res[f64, ParseError].ok{v};
+}
+
+# the f32 a binary32 parse names
+fun as_f32(r: res[u128, ParseError]) res[f32, ParseError] {
+    if (sel r.err) { ret res[f32, ParseError].err{r.err}; }
+    val bits: u32 = r.ok::u32;
+    var v:    f32;
+    memory.raw_copy(?v, ?bits, 4);
+    ret res[f32, ParseError].ok{v};
+}
+
+# the f16 a binary16 parse names
+fun as_f16(r: res[u128, ParseError]) res[f16, ParseError] {
+    if (sel r.err) { ret res[f16, ParseError].err{r.err}; }
+    val bits: u16 = r.ok::u16;
+    var v:    f16;
+    memory.raw_copy(?v, ?bits, 2);
+    ret res[f16, ParseError].ok{v};
+}
+
+# parse a 64-bit floating point number prefix from a string
+#
+# decimal, correctly rounded, as parse_float describes. skips leading whitespace
+# and stops at the first character that is not part of a valid float.
+# use parse_f64_exact to require full input consumption, or parse_f64_len for a
+# span that is not null-terminated.
 # ---
 # s:   string to parse
 # ret: the parsed value, or an error message
@@ -542,170 +739,162 @@ pub fun parse_f64(s: str) res[f64, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f64_len(s: str, len: usize) res[f64, ParseError] {
-    if (len == 0) { ret res[f64, ParseError].err{ParseError.empty{}}; }
-
-    var i: usize = 0;
-
-    for (i < len && char_is_space(s[i])) {
-        i = i + 1;
-    }
-    if (i >= len) { ret res[f64, ParseError].err{ParseError.empty{}}; }
-
-    var sign: f64 = 1.0;
-    if (s[i] == '-') {
-        sign = 0.0 - 1.0;
-        i    = i + 1;
-    }
-    or (s[i] == '+') { i = i + 1; }
-
-    if (i >= len) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
-
-    # inf
-    if (i + 3 <= len && s[i] == 'i' && s[i + 1] == 'n' && s[i + 2] == 'f') {
-        var bits: u64 = 0x7FF0000000000000;
-        if (sign < 0.0) { bits = 0xFFF0000000000000; }
-        var inf_val: f64;
-        memory.raw_copy(?inf_val, ?bits, 8);
-        ret res[f64, ParseError].ok{inf_val};
-    }
-
-    # nan
-    if (i + 3 <= len && s[i] == 'n' && s[i + 1] == 'a' && s[i + 2] == 'n') {
-        val bits:    u64 = 0x7FF8000000000000;
-        var nan_val: f64;
-        memory.raw_copy(?nan_val, ?bits, 8);
-        ret res[f64, ParseError].ok{nan_val};
-    }
-
-    # significand digits and decimal exponent.
-    var M:     bignum.Big;
-    var dexp:  i64  = 0;
-    var trunc: bool = false;
-    if (!collect_significand(s, len, ?i, ?M, ?dexp, ?trunc)) {
-        ret res[f64, ParseError].err{ParseError.syntax{i}};
-    }
-
-    # exponent
-    var exp: i64 = 0;
-    if (i < len && (s[i] == 'e' || s[i] == 'E')) {
-        i = i + 1;
-        var exp_sign: i64 = 1;
-        if (i < len && s[i] == '+') { i = i + 1; }
-        or (i < len && s[i] == '-') {
-            exp_sign = -1;
-            i        = i + 1;
-        }
-
-        var has_exp: bool = false;
-        for (i < len) {
-            val c: u8 = s[i];
-            if (c == '_') {
-                i = i + 1;
-                cnt;
-            }
-            if (c < '0' || c > '9') { brk; }
-            has_exp = true;
-            exp     = exp * 10 + (c - '0')::u64::i64;
-            i       = i + 1;
-        }
-        if (!has_exp) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
-        exp = exp * exp_sign;
-    }
-
-    var bits: u64 = decimal_to_f64(?M, dexp + exp, trunc);
-    if (sign < 0.0) { bits = bits | 0x8000000000000000; }
-    var result: f64;
-    memory.raw_copy(?result, ?bits, 8);
-    ret res[f64, ParseError].ok{result};
+    ret as_f64(parse_float(ieee.F64, Radix.decimal{}, s, len, false));
 }
 
 # parse a 64-bit floating point number from a string, requiring full consumption
 #
 # handles optional sign, integer part, fractional part, and exponent.
-# also handles special values inf, -inf, nan, +inf, +nan.
-# returns an error if there are any characters remaining after the number.
-# leading whitespace is also rejected.
+# also handles special values inf, -inf, nan, +inf, +nan. returns an error if there are any
+# characters remaining after the number. leading whitespace is also rejected.
 # ---
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f64_exact(s: str) res[f64, ParseError] {
-    val len: usize = str_len(s);
-    if (len == 0) { ret res[f64, ParseError].err{ParseError.empty{}}; }
+    ret as_f64(parse_float(ieee.F64, Radix.decimal{}, s, str_len(s), true));
+}
 
-    var i: usize = 0;
+# parse a 32-bit floating point number prefix from a string
+#
+# correctly rounded at f32's own precision, never through f64. otherwise as
+# parse_f64.
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f32(s: str) res[f32, ParseError] {
+    ret parse_f32_len(s, str_len(s));
+}
 
-    var sign: f64 = 1.0;
-    if (s[i] == '-') {
-        sign = 0.0 - 1.0;
-        i    = i + 1;
-    }
-    or (s[i] == '+') { i = i + 1; }
+# parse a 32-bit floating point number prefix from the first `len` bytes of `s`
+# ---
+# s:   the bytes to parse
+# len: the number of bytes available in s
+# ret: the parsed value, or an error message
+pub fun parse_f32_len(s: str, len: usize) res[f32, ParseError] {
+    ret as_f32(parse_float(ieee.F32, Radix.decimal{}, s, len, false));
+}
 
-    if (i >= len) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
+# parse a 32-bit floating point number from a string, requiring full consumption
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f32_exact(s: str) res[f32, ParseError] {
+    ret as_f32(parse_float(ieee.F32, Radix.decimal{}, s, str_len(s), true));
+}
 
-    # inf
-    if (i + 3 <= len && s[i] == 'i' && s[i + 1] == 'n' && s[i + 2] == 'f') {
-        if (i + 3 != len) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
-        var bits: u64 = 0x7FF0000000000000;
-        if (sign < 0.0) { bits = 0xFFF0000000000000; }
-        var inf_val: f64;
-        memory.raw_copy(?inf_val, ?bits, 8);
-        ret res[f64, ParseError].ok{inf_val};
-    }
+# parse a 16-bit floating point number prefix from a string
+#
+# correctly rounded at f16's own precision, never through a wider format.
+# otherwise as parse_f64.
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f16(s: str) res[f16, ParseError] {
+    ret parse_f16_len(s, str_len(s));
+}
 
-    # nan
-    if (i + 3 <= len && s[i] == 'n' && s[i + 1] == 'a' && s[i + 2] == 'n') {
-        if (i + 3 != len) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
-        val bits:    u64 = 0x7FF8000000000000;
-        var nan_val: f64;
-        memory.raw_copy(?nan_val, ?bits, 8);
-        ret res[f64, ParseError].ok{nan_val};
-    }
+# parse a 16-bit floating point number prefix from the first `len` bytes of `s`
+# ---
+# s:   the bytes to parse
+# len: the number of bytes available in s
+# ret: the parsed value, or an error message
+pub fun parse_f16_len(s: str, len: usize) res[f16, ParseError] {
+    ret as_f16(parse_float(ieee.F16, Radix.decimal{}, s, len, false));
+}
 
-    # significand digits and decimal exponent.
-    var M:     bignum.Big;
-    var dexp:  i64  = 0;
-    var trunc: bool = false;
-    if (!collect_significand(s, len, ?i, ?M, ?dexp, ?trunc)) {
-        ret res[f64, ParseError].err{ParseError.syntax{i}};
-    }
+# parse a 16-bit floating point number from a string, requiring full consumption
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f16_exact(s: str) res[f16, ParseError] {
+    ret as_f16(parse_float(ieee.F16, Radix.decimal{}, s, str_len(s), true));
+}
 
-    # exponent
-    var exp: i64 = 0;
-    if (i < len && (s[i] == 'e' || s[i] == 'E')) {
-        i = i + 1;
-        var exp_sign: i64 = 1;
-        if (i < len && s[i] == '+') { i = i + 1; }
-        or (i < len && s[i] == '-') {
-            exp_sign = -1;
-            i        = i + 1;
-        }
+# parse a 64-bit C99 hex float prefix from a string
+#
+# `0x` then hex digits with an optional point and an optional `p` exponent, as
+# parse_float describes, rounded half to even at f64's own precision. skips
+# leading whitespace and stops at the first character past the float.
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f64_hex(s: str) res[f64, ParseError] {
+    ret parse_f64_hex_len(s, str_len(s));
+}
 
-        var has_exp: bool = false;
-        for (i < len) {
-            val c: u8 = s[i];
-            if (c == '_') {
-                i = i + 1;
-                cnt;
-            }
-            if (c < '0' || c > '9') { brk; }
-            has_exp = true;
-            exp     = exp * 10 + (c - '0')::u64::i64;
-            i       = i + 1;
-        }
-        if (!has_exp) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
-        exp = exp * exp_sign;
-    }
+# parse a 64-bit C99 hex float prefix from the first `len` bytes of `s`
+# ---
+# s:   the bytes to parse
+# len: the number of bytes available in s
+# ret: the parsed value, or an error message
+pub fun parse_f64_hex_len(s: str, len: usize) res[f64, ParseError] {
+    ret as_f64(parse_float(ieee.F64, Radix.hex{}, s, len, false));
+}
 
-    if (i != len) {
-        ret res[f64, ParseError].err{ParseError.syntax{i}};
-    }
+# parse a 64-bit C99 hex float from a string, requiring full consumption
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f64_hex_exact(s: str) res[f64, ParseError] {
+    ret as_f64(parse_float(ieee.F64, Radix.hex{}, s, str_len(s), true));
+}
 
-    var bits: u64 = decimal_to_f64(?M, dexp + exp, trunc);
-    if (sign < 0.0) { bits = bits | 0x8000000000000000; }
-    var result: f64;
-    memory.raw_copy(?result, ?bits, 8);
-    ret res[f64, ParseError].ok{result};
+# parse a 32-bit C99 hex float prefix from a string
+#
+# `0x` then hex digits with an optional point and an optional `p` exponent, as
+# parse_float describes, rounded half to even at f32's own precision. skips
+# leading whitespace and stops at the first character past the float.
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f32_hex(s: str) res[f32, ParseError] {
+    ret parse_f32_hex_len(s, str_len(s));
+}
+
+# parse a 32-bit C99 hex float prefix from the first `len` bytes of `s`
+# ---
+# s:   the bytes to parse
+# len: the number of bytes available in s
+# ret: the parsed value, or an error message
+pub fun parse_f32_hex_len(s: str, len: usize) res[f32, ParseError] {
+    ret as_f32(parse_float(ieee.F32, Radix.hex{}, s, len, false));
+}
+
+# parse a 32-bit C99 hex float from a string, requiring full consumption
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f32_hex_exact(s: str) res[f32, ParseError] {
+    ret as_f32(parse_float(ieee.F32, Radix.hex{}, s, str_len(s), true));
+}
+
+# parse a 16-bit C99 hex float prefix from a string
+#
+# `0x` then hex digits with an optional point and an optional `p` exponent, as
+# parse_float describes, rounded half to even at f16's own precision. skips
+# leading whitespace and stops at the first character past the float.
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f16_hex(s: str) res[f16, ParseError] {
+    ret parse_f16_hex_len(s, str_len(s));
+}
+
+# parse a 16-bit C99 hex float prefix from the first `len` bytes of `s`
+# ---
+# s:   the bytes to parse
+# len: the number of bytes available in s
+# ret: the parsed value, or an error message
+pub fun parse_f16_hex_len(s: str, len: usize) res[f16, ParseError] {
+    ret as_f16(parse_float(ieee.F16, Radix.hex{}, s, len, false));
+}
+
+# parse a 16-bit C99 hex float from a string, requiring full consumption
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f16_hex_exact(s: str) res[f16, ParseError] {
+    ret as_f16(parse_float(ieee.F16, Radix.hex{}, s, str_len(s), true));
 }
 
 # whether parse_u64(s, base) succeeds with want
@@ -940,5 +1129,362 @@ test parse__failures_carry_offsets {
     val f3: res[f64, ParseError] = parse_f64_len("3.14", 0);
     if (!sel f3.err)       { ret 11; }
     if (!sel f3.err.empty) { ret 11; }
+    ret 0;
+}
+
+# parse all of s as an f32 and return its pattern, a sentinel past 32 bits on error
+#[testing]
+fun t32(s: str) u64 {
+    val r: res[f32, ParseError] = parse_f32_exact(s);
+    if (sel r.err) { ret 0xDEADBEEF00; }
+    val v:    f32 = r.ok;
+    var bits: u32;
+    memory.raw_copy(?bits, ?v, 4);
+    ret bits::u64;
+}
+
+# parse all of s as an f16 and return its pattern, a sentinel past 16 bits on error
+#[testing]
+fun t16(s: str) u64 {
+    val r: res[f16, ParseError] = parse_f16_exact(s);
+    if (sel r.err) { ret 0xDEADBEEF00; }
+    val v:    f16 = r.ok;
+    var bits: u16;
+    memory.raw_copy(?bits, ?v, 2);
+    ret bits::u64;
+}
+
+# parse all of s as an f32 hex float and return its pattern, a sentinel on error
+#[testing]
+fun x32(s: str) u64 {
+    val r: res[f32, ParseError] = parse_f32_hex_exact(s);
+    if (sel r.err) { ret 0xDEADBEEF00; }
+    val v:    f32 = r.ok;
+    var bits: u32;
+    memory.raw_copy(?bits, ?v, 4);
+    ret bits::u64;
+}
+
+# parse all of s as an f16 hex float and return its pattern, a sentinel on error
+#[testing]
+fun x16(s: str) u64 {
+    val r: res[f16, ParseError] = parse_f16_hex_exact(s);
+    if (sel r.err) { ret 0xDEADBEEF00; }
+    val v:    f16 = r.ok;
+    var bits: u16;
+    memory.raw_copy(?bits, ?v, 2);
+    ret bits::u64;
+}
+
+# parse all of s as an f64 hex float and return its pattern, a sentinel on error
+#[testing]
+fun x64(s: str) u128 {
+    val r: res[f64, ParseError] = parse_f64_hex_exact(s);
+    if (sel r.err) { ret 1::u128 << 100; }
+    val v:    f64 = r.ok;
+    var bits: u64;
+    memory.raw_copy(?bits, ?v, 8);
+    ret bits::u128;
+}
+
+# 1 + 2^-24 + 10^-29 sits above the f32 midpoint 1 + 2^-24 by far less than half
+# an f64 ulp, so f64 rounds it onto the midpoint and the cast then ties to even,
+# down. the f32 parse rounds once, up. glibc strtof gives 0x3F800001 and
+# (float)strtod gives 0x3F800000.
+test parse_f32__rounds_once_where_f64_then_a_cast_rounds_twice {
+    val s: str = "1.00000005960464477539062500001";
+    if (t32(s) != 0x3F800001) { ret 1; }
+    val wide: res[f64, ParseError] = parse_f64_exact(s);
+    if (sel wide.err) { ret 2; }
+    val narrowed: f32 = wide.ok::f32;
+    var bits:     u32;
+    memory.raw_copy(?bits, ?narrowed, 4);
+    if (bits != 0x3F800000) { ret 3; }
+    ret 0;
+}
+
+# every expected pattern is glibc strtof's, and agrees with rounding the literal's
+# exact rational value half to even at 24 bits. the long literals are the exact
+# decimal expansions of the dyadic values the comments name.
+test parse_f32__correctly_rounded_edges {
+    # 1 + 2^-24, the midpoint above 1: even is 1
+    if (t32("1.000000059604644775390625") != 0x3F800000) { ret 1; }
+    # 1 + 3 * 2^-24, the midpoint below 1 + 2^-22: even is up
+    if (t32("1.000000178813934326171875") != 0x3F800002) { ret 2; }
+    # 2^-149, the smallest subnormal
+    if (t32("0.00000000000000000000000000000000000000000000140129846432481707092372958328991613128026194187651577175706828388979108268586060148663818836212158203125") != 0x00000001) { ret 3; }
+    # 2^-149 shortest
+    if (t32("1e-45") != 0x00000001) { ret 4; }
+    # 2^-150, half the smallest subnormal: even is zero
+    if (t32("0.000000000000000000000000000000000000000000000700649232162408535461864791644958065640130970938257885878534141944895541342930300743319094181060791015625") != 0x00000000) { ret 5; }
+    # 2^-150 and a nonzero digit past it: up
+    if (t32("0.0000000000000000000000000000000000000000000007006492321624085354618647916449580656401309709382578858785341419448955413429303007433190941810607910156250000001") != 0x00000001) { ret 6; }
+    # 3 * 2^-150 between subnormals 1 and 2: even is 2
+    if (t32("0.000000000000000000000000000000000000000000002101947696487225606385594374934874196920392912814773657635602425834686624028790902229957282543182373046875") != 0x00000002) { ret 7; }
+    # (2^23 - 1) * 2^-149, the largest subnormal
+    if (t32("0.00000000000000000000000000000000000001175494210692441075487029444849287348827052428745893333857174530571588870475618904265502351336181163787841796875") != 0x007FFFFF) { ret 8; }
+    # (2^24 - 1) * 2^-150, between the largest subnormal and 2^-126: even is up
+    if (t32("0.000000000000000000000000000000000000011754942807573642917278829910357665133228589927589904276829631184250030649651730385585324256680905818939208984375") != 0x00800000) { ret 9; }
+    # 2^-126, the smallest normal
+    if (t32("0.000000000000000000000000000000000000011754943508222875079687365372222456778186655567720875215087517062784172594547271728515625") != 0x00800000) { ret 10; }
+    # 2^-126 shortest
+    if (t32("1.1754944e-38") != 0x00800000) { ret 11; }
+    # (2^24 - 1) * 2^104, the largest finite
+    if (t32("340282346638528859811704183484516925440") != 0x7F7FFFFF) { ret 12; }
+    # the largest finite, shortest
+    if (t32("3.4028235e38") != 0x7F7FFFFF) { ret 13; }
+    # (2^25 - 1) * 2^103, the midpoint past the largest finite: even is inf
+    if (t32("340282356779733661637539395458142568448") != 0x7F800000) { ret 14; }
+    # just under that midpoint: the largest finite
+    if (t32("340282356779733661637539395458142568447.999") != 0x7F7FFFFF) { ret 15; }
+    # 1e39, past the overflow boundary
+    if (t32("1e39") != 0x7F800000) { ret 16; }
+    # negative zero
+    if (t32("-0") != 0x80000000) { ret 17; }
+    # a negative value under half the smallest subnormal is negative zero
+    if (t32("-1e-60") != 0x80000000) { ret 18; }
+    # 0.1
+    if (t32("0.1") != 0x3DCCCCCD) { ret 19; }
+    ret 0;
+}
+
+# every expected pattern is glibc strtof's, and agrees with rounding the
+# literal's exact binary value half to even at 24 bits
+test parse_f32__hex_rounds_half_to_even {
+    # 2^-149
+    if (x32("0x1p-149") != 0x00000001) { ret 1; }
+    # 0x1.998p-4 is exact in f32
+    if (x32("0x1.998p-4") != 0x3DCCC000) { ret 2; }
+    # 1 + 2^-24, a tie: even is 1
+    if (x32("0x1.000001p0") != 0x3F800000) { ret 3; }
+    # 1 + 3 * 2^-24, a tie: even is up
+    if (x32("0x1.000003p0") != 0x3F800002) { ret 4; }
+    # just over 1 + 2^-24: up
+    if (x32("0x1.0000010000000000000000001p0") != 0x3F800001) { ret 5; }
+    # 2^-150, a tie at the subnormal floor: even is zero
+    if (x32("0x1p-150") != 0x00000000) { ret 6; }
+    # just over 2^-150: up to the smallest subnormal
+    if (x32("0x1.0000000000000000000000001p-150") != 0x00000001) { ret 7; }
+    # 1.5 * 2^-149, a subnormal tie: even is 2
+    if (x32("0x1.8p-149") != 0x00000002) { ret 8; }
+    # (2^23 - 1) * 2^-149, the largest subnormal
+    if (x32("0x1.fffffcp-127") != 0x007FFFFF) { ret 9; }
+    # 2^-126, the smallest normal
+    if (x32("0x1p-126") != 0x00800000) { ret 10; }
+    # the largest finite
+    if (x32("0x1.fffffep127") != 0x7F7FFFFF) { ret 11; }
+    # the midpoint past the largest finite: even is inf
+    if (x32("0x1.ffffffp127") != 0x7F800000) { ret 12; }
+    # just under that midpoint: the largest finite
+    if (x32("0x1.fffffefffp127") != 0x7F7FFFFF) { ret 13; }
+    # 2^128 overflows
+    if (x32("0x1p128") != 0x7F800000) { ret 14; }
+    # negative zero
+    if (x32("-0x0p0") != 0x80000000) { ret 15; }
+    # upper case and a signed exponent
+    if (x32("0X1P+3") != 0x41000000) { ret 16; }
+    # a leading point
+    if (x32("0x.8p1") != 0x3F800000) { ret 17; }
+    # no exponent
+    if (x32("0x10") != 0x41800000) { ret 18; }
+    # a negative value
+    if (x32("-0x1.8p1") != 0xC0400000) { ret 19; }
+    ret 0;
+}
+
+# glibc has no f16 parse: every expected pattern rounds the literal's exact
+# rational value half to even at 11 bits (bias 15, subnormal lsb 2^-24) by exact
+# fraction arithmetic, and numpy's binary64 to binary16 conversion agrees on each
+# literal exact in binary64. 0.1 is 1638.4 * 2^-14, so 1638 = 0x666 and field 11.
+test parse_f16__correctly_rounded_edges {
+    # 1 + 2^-11, the midpoint above 1: even is 1
+    if (t16("1.00048828125") != 0x3C00) { ret 1; }
+    # 1 + 3 * 2^-11, a midpoint: even is up
+    if (t16("1.00146484375") != 0x3C02) { ret 2; }
+    # 2^-24, the smallest subnormal
+    if (t16("0.000000059604644775390625") != 0x0001) { ret 3; }
+    # 2^-25, half the smallest subnormal: even is zero
+    if (t16("0.0000000298023223876953125") != 0x0000) { ret 4; }
+    # 2^-25 and a nonzero digit past it: up
+    if (t16("0.00000002980232238769531250000001") != 0x0001) { ret 5; }
+    # 3 * 2^-25 between subnormals 1 and 2: even is 2
+    if (t16("0.0000000894069671630859375") != 0x0002) { ret 6; }
+    # 1023 * 2^-24, the largest subnormal
+    if (t16("0.000060975551605224609375") != 0x03FF) { ret 7; }
+    # 2047 * 2^-25, between the largest subnormal and 2^-14: even is up
+    if (t16("0.0000610053539276123046875") != 0x0400) { ret 8; }
+    # 2^-14, the smallest normal
+    if (t16("0.00006103515625") != 0x0400) { ret 9; }
+    # 65504, the largest finite
+    if (t16("65504") != 0x7BFF) { ret 10; }
+    # 65520, the midpoint past the largest finite: even is inf
+    if (t16("65520") != 0x7C00) { ret 11; }
+    # just under that midpoint: the largest finite
+    if (t16("65519.999") != 0x7BFF) { ret 12; }
+    # 1e5, past the overflow boundary
+    if (t16("1e5") != 0x7C00) { ret 13; }
+    # negative zero
+    if (t16("-0") != 0x8000) { ret 14; }
+    # 0.1
+    if (t16("0.1") != 0x2E66) { ret 15; }
+    # 1 + 2^-11 + 10^-20, which f64 rounds onto the midpoint: up
+    if (t16("1.00048828125000000001") != 0x3C01) { ret 16; }
+    ret 0;
+}
+
+# the expected patterns round the literal's exact binary value half to even at 11
+# bits: 0x1.ffcp15 is 2047 * 2^5 = 65504, and 0x1.998p-4 keeps 0x266 of 0x998
+test parse_f16__hex_rounds_half_to_even {
+    # 2^-24
+    if (x16("0x1p-24") != 0x0001) { ret 1; }
+    # 2^-25, a tie at the floor: even is zero
+    if (x16("0x1p-25") != 0x0000) { ret 2; }
+    # 1.5 * 2^-24, a subnormal tie: even is 2
+    if (x16("0x1.8p-24") != 0x0002) { ret 3; }
+    # 1 + 2^-11, a tie: even is 1
+    if (x16("0x1.002p0") != 0x3C00) { ret 4; }
+    # 1 + 3 * 2^-11, a tie: even is up
+    if (x16("0x1.006p0") != 0x3C02) { ret 5; }
+    # just over 1 + 2^-11: up
+    if (x16("0x1.0020001p0") != 0x3C01) { ret 6; }
+    # 1023 * 2^-24, the largest subnormal
+    if (x16("0x1.ff8p-15") != 0x03FF) { ret 7; }
+    # 2^-14, the smallest normal
+    if (x16("0x1p-14") != 0x0400) { ret 8; }
+    # the largest finite
+    if (x16("0x1.ffcp15") != 0x7BFF) { ret 9; }
+    # the midpoint past the largest finite: even is inf
+    if (x16("0x1.ffep15") != 0x7C00) { ret 10; }
+    # just under that midpoint: the largest finite
+    if (x16("0x1.ffdfp15") != 0x7BFF) { ret 11; }
+    # negative zero
+    if (x16("-0x0p+0") != 0x8000) { ret 12; }
+    # 0x1.998p-4 keeps 10 of its 12 fraction bits, the dropped two zero
+    if (x16("0x1.998p-4") != 0x2E66) { ret 13; }
+    ret 0;
+}
+
+# every expected pattern is glibc strtod's, and agrees with rounding the exact
+# rational half to even at 53 bits
+test parse_f64__subnormal_and_overflow_edges {
+    # (2^52 - 1) * 2^-1074, the largest subnormal
+    if (pbits("0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000022250738585072008890245868760858598876504231122409594654935248025624400092282356951787758888037591552642309780950434312085877387158357291821993020294379224223559819827501242041788969571311791082261043971979604000454897391938079198936081525613113376149842043271751033627391549782731594143828136275113838604094249464942286316695429105080201815926642134996606517803095075913058719846423906068637102005108723282784678843631944515866135041223479014792369585208321597621066375401613736583044193603714778355306682834535634005074073040135602968046375918583163124224521599262546494300836851861719422417646455137135420132217031370496583210154654068035397417906022589503023501937519773030945763173210852507299305089761582519159720757232455434770912461317493580281734466552734375") != 0x000FFFFFFFFFFFFF) { ret 1; }
+    # (2^54 - 1) * 2^970, the midpoint past the largest finite: even is inf
+    if (pbits("179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792") != 0x7FF0000000000000) { ret 2; }
+    # just under that midpoint: the largest finite
+    if (pbits("179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497791.5") != 0x7FEFFFFFFFFFFFFF) { ret 3; }
+    # negative zero
+    if (pbits("-0.0e10") != 0x8000000000000000) { ret 4; }
+    ret 0;
+}
+
+# every expected pattern is glibc strtod's
+test parse_f64__hex_rounds_half_to_even {
+    # 2^-1074
+    if (x64("0x1p-1074") != 0x0000000000000001) { ret 1; }
+    # 2^-1075, a tie at the floor: even is zero
+    if (x64("0x1p-1075") != 0x0000000000000000) { ret 2; }
+    # 1.5 * 2^-1074, a subnormal tie: even is 2
+    if (x64("0x1.8p-1074") != 0x0000000000000002) { ret 3; }
+    # the largest subnormal
+    if (x64("0x0.fffffffffffffp-1022") != 0x000FFFFFFFFFFFFF) { ret 4; }
+    # 1 + 2^-53, a tie: even is 1
+    if (x64("0x1.00000000000008p0") != 0x3FF0000000000000) { ret 5; }
+    # 1 + 3 * 2^-53, a tie: even is up
+    if (x64("0x1.00000000000018p0") != 0x3FF0000000000002) { ret 6; }
+    # the largest finite
+    if (x64("0x1.fffffffffffffp1023") != 0x7FEFFFFFFFFFFFFF) { ret 7; }
+    # the midpoint past the largest finite: even is inf
+    if (x64("0x1.fffffffffffff8p1023") != 0x7FF0000000000000) { ret 8; }
+    # just under that midpoint: the largest finite
+    if (x64("0x1.fffffffffffff7ffp1023") != 0x7FEFFFFFFFFFFFFF) { ret 9; }
+    # 0x1.998p-4
+    if (x64("0x1.998p-4") != 0x3FB9980000000000) { ret 10; }
+    ret 0;
+}
+
+# underscores separate hex digits as they do decimal ones, a huge exponent
+# saturates rather than wrapping, the prefix forms skip whitespace and stop at the
+# first byte past the number, and a `0x` with no digit after it is the decimal 0
+test parse_float__hex_grammar_and_bounds {
+    if (x32("0x1_0p0") != 0x41800000)                          { ret 1; }
+    if (t32("1e99999999999999999999") != 0x7F800000)           { ret 2; }
+    if (t32("-1e-99999999999999999999") != 0x80000000)         { ret 3; }
+    if (x16("0x1p-99999999999999999999") != 0)                 { ret 4; }
+    if (x16("0x1p99999999999999999999") != 0x7C00)             { ret 5; }
+    if (pbits("1e99999999999999999999") != 0x7FF0000000000000) { ret 6; }
+
+    val p: res[f32, ParseError] = parse_f32_hex("  0x1.8p1 tail");
+    if (sel p.err)   { ret 7; }
+    if (p.ok != 3.0) { ret 7; }
+    val q: res[f64, ParseError] = parse_f64_hex_len("0x1p3p9", 5);
+    if (sel q.err)   { ret 8; }
+    if (q.ok != 8.0) { ret 8; }
+
+    val e1: res[f32, ParseError] = parse_f32_hex_exact("0x1p");
+    if (!sel e1.err)        { ret 9; }
+    if (!sel e1.err.syntax) { ret 9; }
+    if (e1.err.syntax != 4) { ret 9; }
+    # a hex parse needs the prefix and a digit after it
+    val e2: res[f32, ParseError] = parse_f32_hex_exact("0x");
+    if (!sel e2.err)        { ret 10; }
+    if (!sel e2.err.syntax) { ret 10; }
+    if (e2.err.syntax != 2) { ret 10; }
+    val e3: res[f16, ParseError] = parse_f16_hex_exact("0x1.8p1x");
+    if (!sel e3.err)        { ret 11; }
+    if (!sel e3.err.syntax) { ret 11; }
+    if (e3.err.syntax != 7) { ret 11; }
+    val e4: res[f16, ParseError] = parse_f16_hex("-1.5");
+    if (!sel e4.err)        { ret 12; }
+    if (!sel e4.err.syntax) { ret 12; }
+    if (e4.err.syntax != 1) { ret 12; }
+    val e5: res[f64, ParseError] = parse_f64_hex_exact("0x.p1");
+    if (!sel e5.err)                                                               { ret 13; }
+    if (!sel e5.err.syntax)                                                        { ret 13; }
+    if (e5.err.syntax != 3)                                                        { ret 13; }
+    if (x16("inf") != 0x7C00 || x16("-inf") != 0xFC00 || x32("nan") != 0x7FC00000) { ret 14; }
+    ret 0;
+}
+
+# the decimal parsers keep their grammar: `0x1p3` is the decimal 0 then a stray
+# `x`, so a prefix parse gives 0 and an exact one refuses the `x` at offset 1,
+# exactly as before hex parsing existed. the hex parsers read it as 8.
+test parse_float__decimal_parsers_never_read_hex {
+    val d: res[f64, ParseError] = parse_f64("0x1p3");
+    if (sel d.err)   { ret 1; }
+    if (d.ok != 0.0) { ret 1; }
+    val e: res[f64, ParseError] = parse_f64_exact("0x1p3");
+    if (!sel e.err)        { ret 2; }
+    if (!sel e.err.syntax) { ret 2; }
+    if (e.err.syntax != 1) { ret 2; }
+    val l: res[f64, ParseError] = parse_f64_len("0x1p3", 5);
+    if (sel l.err)                                                    { ret 3; }
+    if (l.ok != 0.0)                                                  { ret 3; }
+    if (t32("0x1p3") != 0xDEADBEEF00 || t16("0x1p3") != 0xDEADBEEF00) { ret 4; }
+
+    val h: res[f64, ParseError] = parse_f64_hex_exact("0x1p3");
+    if (sel h.err)                                            { ret 5; }
+    if (h.ok != 8.0)                                          { ret 5; }
+    if (x32("0x1p3") != 0x41000000 || x16("0x1p3") != 0x4800) { ret 6; }
+    ret 0;
+}
+
+# a row no conversion was written for parses through the same path: bfloat16
+# keeps 8 bits, so 1 + 2^-8 is a tie to 1 and 1 + 3 * 2^-8 a tie up, and 2^-133
+# is its smallest subnormal
+test parse_float__a_new_row_is_data_only {
+    val bf16: ieee.Format           = ieee.Format{mant_bits: 7, exp_bits: 8, bias: 127};
+    val a:    res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "1.00390625", 10, true);
+    if (sel a.err)      { ret 1; }
+    if (a.ok != 0x3F80) { ret 1; }
+    val b: res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "1.01171875", 10, true);
+    if (sel b.err)      { ret 2; }
+    if (b.ok != 0x3F82) { ret 2; }
+    val c: res[u128, ParseError] = parse_float(bf16, Radix.hex{}, "0x1p-133", 8, true);
+    if (sel c.err)      { ret 3; }
+    if (c.ok != 0x0001) { ret 3; }
+    val d: res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "-3.0e38", 7, true);
+    if (sel d.err)      { ret 4; }
+    if (d.ok != 0xFF62) { ret 4; }
     ret 0;
 }
