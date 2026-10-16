@@ -632,8 +632,9 @@ fun hex_stop(s: str, len: usize, i: usize) usize {
 # whole: require the span be the number exactly, with no leading whitespace or
 #        trailing byte; otherwise skip leading whitespace and stop at the first
 #        byte that is not part of a float
-# work:  storage of parse_float_work(f) u32 words a decimal parse works in; a
-#        hex parse never touches it
+# work:  storage a decimal parse works in, a row's ParseWork type (F64ParseWork
+#        for ieee.F64) or parse_float_work(f) u32 words; a hex parse never
+#        touches it
 # ret:   the pattern in the low end, or the failure
 pub fun parse_float(f: ieee.Format, radix: Radix, s: str, len: usize, whole: bool, work: *u32) res[u128, ParseError] {
     if (len == 0) { ret res[u128, ParseError].err{ParseError.empty{}}; }
@@ -695,10 +696,16 @@ pub fun parse_float(f: ieee.Format, radix: Radix, s: str, len: usize, whole: boo
     ret res[u128, ParseError].ok{bits};
 }
 
-# each row's parse storage, as a stack type
-def F16_WORK: [PARSE_BIGNUMS * ieee.F16_LIMBS]u32;
-def F32_WORK: [PARSE_BIGNUMS * ieee.F32_LIMBS]u32;
-def F64_WORK: [PARSE_BIGNUMS * ieee.F64_LIMBS]u32;
+# parse_float work storage for each row, a u32 array a caller declares and
+# passes as ?work[0]: PARSE_BIGNUMS bignums of the row's committed limbs, the
+# length parse_float_work gives
+pub def F16ParseWork:  [PARSE_BIGNUMS * ieee.F16_LIMBS]u32;
+pub def F32ParseWork:  [PARSE_BIGNUMS * ieee.F32_LIMBS]u32;
+pub def F64ParseWork:  [PARSE_BIGNUMS * ieee.F64_LIMBS]u32;
+#[testing]
+pub def BF16ParseWork: [PARSE_BIGNUMS * ieee.BF16_LIMBS]u32;
+#[testing]
+pub def F128ParseWork: [PARSE_BIGNUMS * ieee.F128_LIMBS]u32;
 
 # a decimal parse of f in stack storage of type W, a u32 array sized for f
 fun decimal_in[W](f: ieee.Format, s: str, len: usize, whole: bool) res[u128, ParseError] {
@@ -757,7 +764,7 @@ pub fun parse_f64(s: str) res[f64, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f64_len(s: str, len: usize) res[f64, ParseError] {
-    ret as_f64(decimal_in[F64_WORK](ieee.F64, s, len, false));
+    ret as_f64(decimal_in[F64ParseWork](ieee.F64, s, len, false));
 }
 
 # parse a 64-bit floating point number from a string, requiring full consumption
@@ -769,7 +776,7 @@ pub fun parse_f64_len(s: str, len: usize) res[f64, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f64_exact(s: str) res[f64, ParseError] {
-    ret as_f64(decimal_in[F64_WORK](ieee.F64, s, str_len(s), true));
+    ret as_f64(decimal_in[F64ParseWork](ieee.F64, s, str_len(s), true));
 }
 
 # parse a 32-bit floating point number prefix from a string
@@ -789,7 +796,7 @@ pub fun parse_f32(s: str) res[f32, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f32_len(s: str, len: usize) res[f32, ParseError] {
-    ret as_f32(decimal_in[F32_WORK](ieee.F32, s, len, false));
+    ret as_f32(decimal_in[F32ParseWork](ieee.F32, s, len, false));
 }
 
 # parse a 32-bit floating point number from a string, requiring full consumption
@@ -797,7 +804,7 @@ pub fun parse_f32_len(s: str, len: usize) res[f32, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f32_exact(s: str) res[f32, ParseError] {
-    ret as_f32(decimal_in[F32_WORK](ieee.F32, s, str_len(s), true));
+    ret as_f32(decimal_in[F32ParseWork](ieee.F32, s, str_len(s), true));
 }
 
 # parse a 16-bit floating point number prefix from a string
@@ -817,7 +824,7 @@ pub fun parse_f16(s: str) res[f16, ParseError] {
 # len: the number of bytes available in s
 # ret: the parsed value, or an error message
 pub fun parse_f16_len(s: str, len: usize) res[f16, ParseError] {
-    ret as_f16(decimal_in[F16_WORK](ieee.F16, s, len, false));
+    ret as_f16(decimal_in[F16ParseWork](ieee.F16, s, len, false));
 }
 
 # parse a 16-bit floating point number from a string, requiring full consumption
@@ -825,7 +832,7 @@ pub fun parse_f16_len(s: str, len: usize) res[f16, ParseError] {
 # s:   string to parse
 # ret: the parsed value, or an error message
 pub fun parse_f16_exact(s: str) res[f16, ParseError] {
-    ret as_f16(decimal_in[F16_WORK](ieee.F16, s, str_len(s), true));
+    ret as_f16(decimal_in[F16ParseWork](ieee.F16, s, str_len(s), true));
 }
 
 # parse a 64-bit C99 hex float prefix from a string
@@ -1491,7 +1498,7 @@ test parse_float__decimal_parsers_never_read_hex {
 # keeps 8 bits, so 1 + 2^-8 is a tie to 1 and 1 + 3 * 2^-8 a tie up, and 2^-133
 # is its smallest subnormal
 test parse_float__a_new_row_is_data_only {
-    var work: [PARSE_BIGNUMS * ieee.BF16_LIMBS]u32;
+    var work: BF16ParseWork;
     val bf16: ieee.Format           = ieee.BF16;
     val a:    res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "1.00390625", 10, true, ?work[0]);
     if (sel a.err)      { ret 1; }
@@ -1503,17 +1510,18 @@ test parse_float__a_new_row_is_data_only {
     if (sel c.err)      { ret 3; }
     if (c.ok != 0x0001) { ret 3; }
     val d: res[u128, ParseError] = parse_float(bf16, Radix.decimal{}, "-3.0e38", 7, true, ?work[0]);
-    if (sel d.err)                                                 { ret 4; }
-    if (d.ok != 0xFF62)                                            { ret 4; }
-    if (parse_float_work(bf16) != PARSE_BIGNUMS * ieee.BF16_LIMBS) { ret 5; }
+    if (sel d.err)      { ret 4; }
+    if (d.ok != 0xFF62) { ret 4; }
     ret 0;
 }
 
 # each row's stack storage is exactly what parse_float asks for
 test parse_float__every_row_sizes_its_storage {
-    if (parse_float_work(ieee.F16) != $length_of(F16_WORK)) { ret 1; }
-    if (parse_float_work(ieee.F32) != $length_of(F32_WORK)) { ret 2; }
-    if (parse_float_work(ieee.F64) != $length_of(F64_WORK)) { ret 3; }
+    if (parse_float_work(ieee.F16) != $length_of(F16ParseWork))   { ret 1; }
+    if (parse_float_work(ieee.F32) != $length_of(F32ParseWork))   { ret 2; }
+    if (parse_float_work(ieee.F64) != $length_of(F64ParseWork))   { ret 3; }
+    if (parse_float_work(ieee.BF16) != $length_of(BF16ParseWork)) { ret 4; }
+    if (parse_float_work(ieee.F128) != $length_of(F128ParseWork)) { ret 5; }
     ret 0;
 }
 
@@ -1526,7 +1534,7 @@ fun b128(hi: u64, lo: u64) u128 {
 # whether all of s parses as binary128 to want, in storage sized for that row
 #[testing]
 fun q128_is(radix: Radix, s: str, want: u128) bool {
-    var work: [PARSE_BIGNUMS * ieee.F128_LIMBS]u32;
+    var work: F128ParseWork;
     val r:    res[u128, ParseError] = parse_float(ieee.F128, radix, s, str_len(s), true, ?work[0]);
     ret sel r.ok && r.ok == want;
 }
@@ -1537,7 +1545,6 @@ fun q128_is(radix: Radix, s: str, want: u128) bool {
 test parse_float__binary128_rounds_at_every_edge {
     val dec: Radix = Radix.decimal{};
     val hex: Radix = Radix.hex{};
-    if (parse_float_work(ieee.F128) != PARSE_BIGNUMS * ieee.F128_LIMBS) { ret 1; }
     # 1 + 2^-113 and 1 + 3 * 2^-113, exact midpoints: even is down, then up
     if (!q128_is(dec, "1.00000000000000000000000000000000009629649721936179265279889712924636592690508241076940976199693977832794189453125", b128(0x3FFF000000000000, 0)))  { ret 2; }
     if (!q128_is(dec, "1.00000000000000000000000000000000028888949165808537795839669138773909778071524723230822928599081933498382568359375", b128(0x3FFF000000000000, 2)))  { ret 3; }

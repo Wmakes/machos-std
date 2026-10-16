@@ -478,13 +478,28 @@ pub fun write_float_g_work(fmt: ieee.Format) usize {
     ret write_float_work(fmt) + (g_text(fmt) + 3) / 4;
 }
 
-# each row's writer bignums and fixed-precision text, as stack types
-def F16_WORK:   [WRITE_BIGNUMS * ieee.F16_LIMBS]u32;
-def F32_WORK:   [WRITE_BIGNUMS * ieee.F32_LIMBS]u32;
-def F64_WORK:   [WRITE_BIGNUMS * ieee.F64_LIMBS]u32;
-def F16_G_TEXT: [2 * ieee.F16_SIG_DIGITS + LINE_SLACK]u8;
-def F32_G_TEXT: [2 * ieee.F32_SIG_DIGITS + LINE_SLACK]u8;
-def F64_G_TEXT: [2 * ieee.F64_SIG_DIGITS + LINE_SLACK]u8;
+# write_float work storage for each row, a u32 array a caller declares and
+# passes as ?work[0]: WRITE_BIGNUMS bignums of the row's committed limbs, the
+# length write_float_work gives
+pub def F16WriteWork:  [WRITE_BIGNUMS * ieee.F16_LIMBS]u32;
+pub def F32WriteWork:  [WRITE_BIGNUMS * ieee.F32_LIMBS]u32;
+pub def F64WriteWork:  [WRITE_BIGNUMS * ieee.F64_LIMBS]u32;
+#[testing]
+pub def BF16WriteWork: [WRITE_BIGNUMS * ieee.BF16_LIMBS]u32;
+#[testing]
+pub def F128WriteWork: [WRITE_BIGNUMS * ieee.F128_LIMBS]u32;
+
+# write_float_g work storage for each row, a u32 array a caller declares and
+# passes as ?work[0]: the row's WriteWork and the words of its digits and line
+# (two of the row's committed significant digits and LINE_SLACK bytes), the
+# length write_float_g_work gives. it also serves write_float
+pub def F16WriteGWork:  [WRITE_BIGNUMS * ieee.F16_LIMBS + (2 * ieee.F16_SIG_DIGITS + LINE_SLACK + 3) / 4]u32;
+pub def F32WriteGWork:  [WRITE_BIGNUMS * ieee.F32_LIMBS + (2 * ieee.F32_SIG_DIGITS + LINE_SLACK + 3) / 4]u32;
+pub def F64WriteGWork:  [WRITE_BIGNUMS * ieee.F64_LIMBS + (2 * ieee.F64_SIG_DIGITS + LINE_SLACK + 3) / 4]u32;
+#[testing]
+pub def BF16WriteGWork: [WRITE_BIGNUMS * ieee.BF16_LIMBS + (2 * ieee.BF16_SIG_DIGITS + LINE_SLACK + 3) / 4]u32;
+#[testing]
+pub def F128WriteGWork: [WRITE_BIGNUMS * ieee.F128_LIMBS + (2 * ieee.F128_SIG_DIGITS + LINE_SLACK + 3) / 4]u32;
 
 # an output line built in caller storage
 rec Line {
@@ -630,7 +645,8 @@ fun put_shortest_in[W](l: *Line, fmt: ieee.Format, bits: u128) {
 # w:    target writer
 # fmt:  the pattern's format
 # bits: the pattern in the low end
-# work: storage of write_float_work(fmt) u32 words the digits are found in
+# work: storage the digits are found in, a row's WriteWork type (F64WriteWork
+#       for ieee.F64) or write_float_work(fmt) u32 words
 # ret:  bytes written, or the writer's failure with the persisted prefix
 pub fun write_float(w: *writer.Writer, fmt: ieee.Format, bits: u128, work: *u32) res[usize, WriteError] {
     var out: [SHORTEST_LINE]u8;
@@ -647,7 +663,7 @@ pub fun write_float(w: *writer.Writer, fmt: ieee.Format, bits: u128, work: *u32)
 pub fun write_f64(w: *writer.Writer, n: f64) res[usize, WriteError] {
     var out: [SHORTEST_LINE]u8;
     var l:   Line = Line{buf: ?out[0], n: 0};
-    put_shortest_in[F64_WORK](?l, ieee.F64, f64_bits(n));
+    put_shortest_in[F64WriteWork](?l, ieee.F64, f64_bits(n));
     ret write_bytes(w, ?out[0], l.n);
 }
 
@@ -661,7 +677,7 @@ pub fun write_f64(w: *writer.Writer, n: f64) res[usize, WriteError] {
 pub fun write_f32(w: *writer.Writer, n: f32) res[usize, WriteError] {
     var out: [SHORTEST_LINE]u8;
     var l:   Line = Line{buf: ?out[0], n: 0};
-    put_shortest_in[F32_WORK](?l, ieee.F32, f32_bits(n));
+    put_shortest_in[F32WriteWork](?l, ieee.F32, f32_bits(n));
     ret write_bytes(w, ?out[0], l.n);
 }
 
@@ -673,7 +689,7 @@ pub fun write_f32(w: *writer.Writer, n: f32) res[usize, WriteError] {
 pub fun write_f16(w: *writer.Writer, n: f16) res[usize, WriteError] {
     var out: [SHORTEST_LINE]u8;
     var l:   Line = Line{buf: ?out[0], n: 0};
-    put_shortest_in[F16_WORK](?l, ieee.F16, f16_bits(n));
+    put_shortest_in[F16WriteWork](?l, ieee.F16, f16_bits(n));
     ret write_bytes(w, ?out[0], l.n);
 }
 
@@ -837,14 +853,6 @@ fun put_fixed(l: *Line, dig: *u8, fmt: ieee.Format, bits: u128, precision: usize
     }
 }
 
-# put_fixed with its bignums in stack storage of type W, a u32 array, released
-# before the line is written
-#[noinline]
-fun put_fixed_in[W](l: *Line, dig: *u8, fmt: ieee.Format, bits: u128, precision: usize) {
-    var work: W;
-    put_fixed(l, dig, fmt, bits, precision, (?work)::*u32);
-}
-
 # write a float of any ieee.Format row to a fixed number of significant digits
 #
 # C's `%.Ng`: the exact value rounded half to even to `precision` significant
@@ -858,8 +866,9 @@ fun put_fixed_in[W](l: *Line, dig: *u8, fmt: ieee.Format, bits: u128, precision:
 # fmt:       the pattern's format
 # bits:      the pattern in the low end
 # precision: significant digits
-# work:      storage of write_float_g_work(fmt) u32 words the digits and the
-#            line are built in
+# work:      storage the digits and the line are built in, a row's WriteGWork
+#            type (F64WriteGWork for ieee.F64) or write_float_g_work(fmt) u32
+#            words
 # ret:       bytes written, or the writer's failure with the persisted prefix
 pub fun write_float_g(w: *writer.Writer, fmt: ieee.Format, bits: u128, precision: usize, work: *u32) res[usize, WriteError] {
     val dig: *u8  = (?work[write_float_work(fmt)])::*u8;
@@ -875,10 +884,8 @@ pub fun write_float_g(w: *writer.Writer, fmt: ieee.Format, bits: u128, precision
 # precision: significant digits
 # ret:       bytes written, or the writer's failure with the persisted prefix
 pub fun write_f64_g(w: *writer.Writer, n: f64, precision: usize) res[usize, WriteError] {
-    var text: F64_G_TEXT;
-    var l:    Line = Line{buf: ?text[ieee.F64_SIG_DIGITS], n: 0};
-    put_fixed_in[F64_WORK](?l, ?text[0], ieee.F64, f64_bits(n), precision);
-    ret write_bytes(w, l.buf, l.n);
+    var work: F64WriteGWork;
+    ret write_float_g(w, ieee.F64, f64_bits(n), precision, ?work[0]);
 }
 
 # write a 32-bit float to `precision` significant digits, as write_float_g
@@ -888,10 +895,8 @@ pub fun write_f64_g(w: *writer.Writer, n: f64, precision: usize) res[usize, Writ
 # precision: significant digits
 # ret:       bytes written, or the writer's failure with the persisted prefix
 pub fun write_f32_g(w: *writer.Writer, n: f32, precision: usize) res[usize, WriteError] {
-    var text: F32_G_TEXT;
-    var l:    Line = Line{buf: ?text[ieee.F32_SIG_DIGITS], n: 0};
-    put_fixed_in[F32_WORK](?l, ?text[0], ieee.F32, f32_bits(n), precision);
-    ret write_bytes(w, l.buf, l.n);
+    var work: F32WriteGWork;
+    ret write_float_g(w, ieee.F32, f32_bits(n), precision, ?work[0]);
 }
 
 # write a 16-bit float to `precision` significant digits, as write_float_g
@@ -901,10 +906,8 @@ pub fun write_f32_g(w: *writer.Writer, n: f32, precision: usize) res[usize, Writ
 # precision: significant digits
 # ret:       bytes written, or the writer's failure with the persisted prefix
 pub fun write_f16_g(w: *writer.Writer, n: f16, precision: usize) res[usize, WriteError] {
-    var text: F16_G_TEXT;
-    var l:    Line = Line{buf: ?text[ieee.F16_SIG_DIGITS], n: 0};
-    put_fixed_in[F16_WORK](?l, ?text[0], ieee.F16, f16_bits(n), precision);
-    ret write_bytes(w, l.buf, l.n);
+    var work: F16WriteGWork;
+    ret write_float_g(w, ieee.F16, f16_bits(n), precision, ?work[0]);
 }
 
 # a parsed `{...}` hole spec
@@ -1223,9 +1226,9 @@ pub fun write_value(w: *writer.Writer, va: ...) res[usize, WriteError] {
         var fr: res[usize, WriteError];
         $if ($type_of(arg) == str)  { fr = fmt_str_field(w, (arg::usize)::str, ?sp); }
         $or ($type_of(arg) == ptr)  { fr = fmt_ptr_field(w, (arg::usize)::ptr, ?sp); }
-        $or ($type_of(arg) == f64)  { fr = fmt_float_field[F64_WORK](w, ieee.F64, f64_bits(arg::f64), ?sp); }
-        $or ($type_of(arg) == f32)  { fr = fmt_float_field[F32_WORK](w, ieee.F32, f32_bits(arg::f32), ?sp); }
-        $or ($type_of(arg) == f16)  { fr = fmt_float_field[F16_WORK](w, ieee.F16, f16_bits(arg::f16), ?sp); }
+        $or ($type_of(arg) == f64)  { fr = fmt_float_field[F64WriteWork](w, ieee.F64, f64_bits(arg::f64), ?sp); }
+        $or ($type_of(arg) == f32)  { fr = fmt_float_field[F32WriteWork](w, ieee.F32, f32_bits(arg::f32), ?sp); }
+        $or ($type_of(arg) == f16)  { fr = fmt_float_field[F16WriteWork](w, ieee.F16, f16_bits(arg::f16), ?sp); }
         $or ($type_of(arg) == i128) { fr = fmt_i128(w, arg::i128, ?sp); }
         $or ($type_of(arg) == i64)  { fr = fmt_i64(w, arg::i64, ?sp); }
         $or ($type_of(arg) == i32)  { fr = fmt_i64(w, arg::i64, ?sp); }
@@ -1280,9 +1283,9 @@ pub fun vformat(w: *writer.Writer, fmt: str, va: ...) res[usize, FormatError] {
         var fr: res[usize, WriteError];
         $if ($type_of(arg) == str)  { fr = fmt_str_field(w, (arg::usize)::str, ?sp); }
         $or ($type_of(arg) == ptr)  { fr = fmt_ptr_field(w, (arg::usize)::ptr, ?sp); }
-        $or ($type_of(arg) == f64)  { fr = fmt_float_field[F64_WORK](w, ieee.F64, f64_bits(arg::f64), ?sp); }
-        $or ($type_of(arg) == f32)  { fr = fmt_float_field[F32_WORK](w, ieee.F32, f32_bits(arg::f32), ?sp); }
-        $or ($type_of(arg) == f16)  { fr = fmt_float_field[F16_WORK](w, ieee.F16, f16_bits(arg::f16), ?sp); }
+        $or ($type_of(arg) == f64)  { fr = fmt_float_field[F64WriteWork](w, ieee.F64, f64_bits(arg::f64), ?sp); }
+        $or ($type_of(arg) == f32)  { fr = fmt_float_field[F32WriteWork](w, ieee.F32, f32_bits(arg::f32), ?sp); }
+        $or ($type_of(arg) == f16)  { fr = fmt_float_field[F16WriteWork](w, ieee.F16, f16_bits(arg::f16), ?sp); }
         $or ($type_of(arg) == i128) { fr = fmt_i128(w, arg::i128, ?sp); }
         $or ($type_of(arg) == i64)  { fr = fmt_i64(w, arg::i64, ?sp); }
         $or ($type_of(arg) == i32)  { fr = fmt_i64(w, arg::i64, ?sp); }
@@ -2029,7 +2032,7 @@ $if (capability.HOSTED) {
     #[testing]
     fun trip(fmt: ieee.Format, bits: u128, how: u8, precision: usize) bool {
         # storage for any binary64 or narrower conversion
-        var work: [F64_G_WORK]u32;
+        var work: F64WriteGWork;
         var s:    [1024]u8;
         var tb:   TestBuf;
         var w:    writer.Writer = sink(?tb, ?s[0], 1023);
@@ -2109,21 +2112,13 @@ $if (capability.HOSTED) {
         ret 0;
     }
 
-    # binary64 storage for any of its writers
-    #[testing]
-    val F64_G_WORK: usize = WRITE_BIGNUMS * ieee.F64_LIMBS + (2 * ieee.F64_SIG_DIGITS + LINE_SLACK + 3) / 4;
-
-    # bfloat16 storage for any of its writers
-    #[testing]
-    val BF16_G_WORK: usize = WRITE_BIGNUMS * ieee.BF16_LIMBS + (2 * ieee.BF16_SIG_DIGITS + LINE_SLACK + 3) / 4;
-
     # a row no writer was written for runs the same writers: bfloat16 2^-133 is
     # its smallest subnormal, 0x0.02p-126 with 7 fraction bits left-aligned in two
     # hex digits, and 1 + 2^-7 is shortest as 1.01, the one
     # two-place decimal inside its half-gaps (1.00390625, 1.01171875)
     test float__a_new_row_is_data_only {
         val bf16: ieee.Format   = ieee.BF16;
-        var work: [BF16_G_WORK]u32;
+        var work: BF16WriteGWork;
         var s:    [64]u8;
         var tb:   TestBuf;
         var w:    writer.Writer = sink(?tb, ?s[0], 63);
@@ -2132,28 +2127,24 @@ $if (capability.HOSTED) {
         if (!wrote(write_float(?w, bf16, 0x3F81, ?work[0]), ?tb, "1.01")) { ret 2; }
         w = sink(?tb, ?s[0], 63);
         if (!wrote(write_float_g(?w, bf16, 0x3F81, 9, ?work[0]), ?tb, "1.0078125")) { ret 3; }
-        if (write_float_g_work(bf16) != BF16_G_WORK)                                { ret 4; }
         ret 0;
     }
 
     # each row's stack storage is exactly what its writers ask for
     test float__every_row_sizes_its_writer_storage {
-        if (write_float_work(ieee.F16) != $length_of(F16_WORK) || g_text(ieee.F16) != $length_of(F16_G_TEXT)) { ret 1; }
-        if (write_float_work(ieee.F32) != $length_of(F32_WORK) || g_text(ieee.F32) != $length_of(F32_G_TEXT)) { ret 2; }
-        if (write_float_work(ieee.F64) != $length_of(F64_WORK) || g_text(ieee.F64) != $length_of(F64_G_TEXT)) { ret 3; }
-        if (write_float_g_work(ieee.F64) != F64_G_WORK)                                                       { ret 4; }
+        if (write_float_work(ieee.F16) != $length_of(F16WriteWork) || write_float_g_work(ieee.F16) != $length_of(F16WriteGWork))     { ret 1; }
+        if (write_float_work(ieee.F32) != $length_of(F32WriteWork) || write_float_g_work(ieee.F32) != $length_of(F32WriteGWork))     { ret 2; }
+        if (write_float_work(ieee.F64) != $length_of(F64WriteWork) || write_float_g_work(ieee.F64) != $length_of(F64WriteGWork))     { ret 3; }
+        if (write_float_work(ieee.BF16) != $length_of(BF16WriteWork) || write_float_g_work(ieee.BF16) != $length_of(BF16WriteGWork)) { ret 4; }
+        if (write_float_work(ieee.F128) != $length_of(F128WriteWork) || write_float_g_work(ieee.F128) != $length_of(F128WriteGWork)) { ret 5; }
         ret 0;
     }
-
-    # binary128 storage for any of its writers
-    #[testing]
-    val F128_G_WORK: usize = WRITE_BIGNUMS * ieee.F128_LIMBS + (2 * ieee.F128_SIG_DIGITS + LINE_SLACK + 3) / 4;
 
     # whether a writer wrote want for the binary128 pattern hi:lo, how picking
     # the writer as trip does
     #[testing]
     fun w128_is(hi: u64, lo: u64, how: u8, precision: usize, want: str) bool {
-        var work: [F128_G_WORK]u32;
+        var work: F128WriteGWork;
         var s:    [256]u8;
         var tb:   TestBuf;
         var w:    writer.Writer = sink(?tb, ?s[0], 255);
@@ -2171,7 +2162,6 @@ $if (capability.HOSTED) {
     # quadmath_snprintf of the same pattern: `%Qa`, `%.NQg`, and for the shortest
     # the fewest `%.NQe` digits strtoflt128 reads back, laid out as write_float does
     test float__binary128_writes_at_every_edge {
-        if (write_float_g_work(ieee.F128) != F128_G_WORK) { ret 1; }
         # 2^-16494
         if (!w128_is(0, 1, TRIP_SHORTEST, 0, "6e-4966"))                                                 { ret 2; }
         if (!w128_is(0, 1, TRIP_HEX, 0, "0x0.0000000000000000000000000001p-16382"))                      { ret 2; }
@@ -2227,7 +2217,7 @@ $if (capability.HOSTED) {
     # deciding digit, which is all 11529 digits of its exact expansion. the ends
     # are of exact expansions (libquadmath's `%.4933Qg` agrees with the first)
     test float__binary128_fixed_writes_every_digit {
-        var work: [F128_G_WORK]u32;
+        var work: F128WriteGWork;
         var s:    [11600]u8;
         var tb:   TestBuf;
         var w:    writer.Writer          = sink(?tb, ?s[0], 11599);

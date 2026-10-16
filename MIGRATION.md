@@ -66,6 +66,25 @@ Every spawn and exec, in `std.process.exec` and `std.system.os` alike, takes the
 | `use std.types.semver.semver_parse;`, `semver_parse(s, a)` | removed; version handling lives in mach |
 | `use std.types.semver.semver_compare;`, `semver_is_stable`, `semver_is_prerelease`, `semver_has_build` | removed; version handling lives in mach |
 
+## float conversion work storage has published types (#1089)
+
+`std.text.parse.parse_float`, `std.format.write_float` and `std.format.write_float_g` take their bignum work storage from the caller as `work: *u32`. Each row now has a published type for it, a `u32` array derived from std's own bignum counts, line slack and the row's committed limb and digit counts. Declare it on the stack and pass `?work[0]`. Code that hard-coded a size (4 or 5 bignums of `ieee.F64_LIMBS`, a 32-byte line) should declare the type instead, so the storage follows std when a count changes. The runtime functions `parse_float_work`, `write_float_work` and `write_float_g_work` stay for storage sized at runtime.
+
+| conversion | f16 | f32 | f64 |
+| --- | --- | --- | --- |
+| `parse.parse_float` | `parse.F16ParseWork` | `parse.F32ParseWork` | `parse.F64ParseWork` |
+| `format.write_float` | `format.F16WriteWork` | `format.F32WriteWork` | `format.F64WriteWork` |
+| `format.write_float_g` (also serves `write_float`) | `format.F16WriteGWork` | `format.F32WriteGWork` | `format.F64WriteGWork` |
+
+```mach
+# before
+var work: [5 * ieee.F64_LIMBS + (2 * ieee.F64_SIG_DIGITS + 32 + 3) / 4]u32;
+
+# after
+var work: format.F64WriteGWork;
+format.write_float_g(?w, ieee.F64, bits, 17, ?work[0]);
+```
+
 # std 6.x to 7.0.0
 
 std 7.0.0 makes the memory behind `io.runtime` reachable (#677). A runtime takes the allocator every one of its allocations comes from, and every driver registered on it draws from the same allocator.
