@@ -311,6 +311,13 @@ test tcp__ipv6_loopback_bind_connect_and_accept {
     }
     val ep: ip.Endpoint                   = ip.endpoint_v6(ip.ipv6_loopback(), 0, 0);
     val lr: res[Listener, io_error.Error] = listen(ep, 1);
+    $if (capability.MACHOS) {
+        # The MachOS kernel currently exposes IPv4 only. Verify its refusal.
+        if (sel lr.err) {
+            if (lr.err.kind == io_error.UNSUPPORTED) { ret 0; }
+        }
+        ret 2;
+    }
     if (sel lr.err) { ret 1; }
     var listener: Listener = lr.ok;
 
@@ -551,12 +558,12 @@ test tcp__read_timeout_bounds_a_blocking_read {
 }
 
 # several listeners with SO_REUSEPORT bind one port, and every connection is
-# accepted on one of them. windows has no SO_REUSEPORT and refuses before
-# creating a socket
+# accepted on one of them. Windows and MachOS refuse the unsupported option
+# before creating a socket.
 test tcp__listeners_with_reuse_port_share_one_port {
     val shared:   ListenOptions = ListenOptions{bind: socket_api.BindOptions{reuse_address: true, reuse_port: true}, backlog: 16};
     val any_port: ip.Endpoint   = ip.endpoint(127, 0, 0, 1, 0);
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.os == $mach.os.windows || capability.MACHOS) {
         val refused: res[Listener, io_error.Error] = listen_with(any_port, shared);
         if (sel refused.ok) {
             var unexpected: Listener = refused.ok;

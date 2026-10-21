@@ -1,4 +1,4 @@
-# linux native resolver adapter
+# Native DNS resolver adapter for Linux and MachOS.
 #
 # resolution policy, in order: numeric addresses, RFC 6761 localhost names,
 # the hosts file, then DNS over the resolv.conf nameservers with search-domain
@@ -8,8 +8,11 @@
 # (systemd-resolved and peers) keep that policy, since the stub sits behind
 # the nameserver interface.
 
-$if ($mach.build.os != $mach.os.linux) {
-    $error("std.net.resolve.linux: requires linux target");
+use std.system.capability;
+
+# MachOS uses the same pure Mach resolver through its socket layer.
+$if ($mach.build.os != $mach.os.linux && !capability.MACHOS) {
+    $error("std.net.resolve.linux: requires Linux or MachOS target");
 }
 
 use std.allocator;

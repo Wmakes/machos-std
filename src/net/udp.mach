@@ -201,6 +201,13 @@ test udp__duplicate_close_is_normalized {
 test udp__ipv6_loopback_bind {
     val ep: ip.Endpoint                 = ip.endpoint_v6(ip.ipv6_loopback(), 0, 0);
     val r:  res[Socket, io_error.Error] = bind(ep);
+    $if (capability.MACHOS) {
+        # The MachOS kernel currently exposes IPv4 only. Verify its refusal.
+        if (sel r.err) {
+            if (r.err.kind == io_error.UNSUPPORTED) { ret 0; }
+        }
+        ret 2;
+    }
     if (sel r.err) { ret 1; }
     var s: Socket = r.ok;
     if (s.family != os.AF_INET6) {
@@ -212,11 +219,12 @@ test udp__ipv6_loopback_bind {
 }
 
 # several datagram sockets with SO_REUSEPORT bind one port, and every datagram
-# sent to it arrives on one of them. windows refuses before creating a socket
+# sent to it arrives on one of them. Windows and MachOS verify refusal of
+# their unsupported option before creating a socket.
 test udp__sockets_with_reuse_port_share_one_port {
     val shared:   socket_api.BindOptions = socket_api.BindOptions{reuse_address: true, reuse_port: true};
     val any_port: ip.Endpoint            = ip.endpoint(127, 0, 0, 1, 0);
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.os == $mach.os.windows || capability.MACHOS) {
         val refused: res[Socket, io_error.Error] = bind_with(any_port, shared);
         if (sel refused.ok) {
             var unexpected: Socket = refused.ok;

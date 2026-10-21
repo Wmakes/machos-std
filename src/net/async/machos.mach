@@ -1,7 +1,7 @@
 # the MachOS part of the readiness backend for internet sockets
 # backend for std.net.async, signatures may change in a minor release (README, API surface)
-# std.net.async.unix holds the backend. MachOS's datagrams carry no control
-# messages, so no packet says where it was sent to or on which interface
+# std.net.async.unix holds the backend. native receive metadata preserves
+# the destination and receiving interface, including wildcard-bound sockets.
 
 $if (!($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos")) {
     $error("std.net.async.machos: requires the machos platform");
@@ -9,6 +9,8 @@ $if (!($mach.build.os == $mach.os.freestanding && $mach.build.platform == "macho
 
 use std.net.async.types;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.net.ip;
 use std.types.size.usize;
 
 pub val MSG_TRUNC: i32 = 0x20;
@@ -19,6 +21,11 @@ pub fun configure_datagram(resource: usize, family: i32) i64 { ret 0; }
 pub fun packet_metadata(packet: *types.Packet, control: *u8, length: usize) {
     packet.has_local_destination = false;
     packet.interface_index       = 0;
+    if (control != nil && length >= 8) {
+        packet.local_destination = ip.addr_v4(ip.ipv4_from_u32(@(control::*u32)));
+        packet.interface_index = @((control::usize + 4)::*u32);
+        packet.has_local_destination = true;
+    }
 }
 
 pub fun packet_send_metadata(packet: *types.Packet, control: *u8, length: *usize) i64 {
