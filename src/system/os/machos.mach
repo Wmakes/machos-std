@@ -81,6 +81,7 @@ val SYS_ACCEPT4:   usize = 91;
 val SYS_SHUTDOWN:  usize = 77;
 val SYS_GETPEERNAME: usize = 78;
 val SYS_SYMLINK: usize = 93;
+val SYS_PUBLICATION_CAPABILITIES: usize = 94;
 val SYS_FCHMOD: usize = 95;
 val SYS_THREAD_NAME: usize = 97;
 val SYS_AFFINITY: usize = 98;
@@ -584,10 +585,7 @@ pub fun set_mode_at(dirfd: i32, name: *u8, mode: i32) i64 {
 
 # metadata handles retain identity through replacement without content access
 pub fun publication_capabilities(fd: i32) i64 {
-    var st: stat_t;
-    val r:  i64 = stat(fd, ?st);
-    if (r < 0) { ret r; }
-    ret os_shared.PUBLICATION_READ_RETAIN_REPLACE;
+    ret syscall1(SYS_PUBLICATION_CAPABILITIES, fd::isize::usize);
 }
 
 pub fun file_identity(fd: i32, out: *identities.Identity) i64 {
