@@ -9,8 +9,8 @@
 #
 # MachOS paths are (pointer, length) pairs relative to the working directory.
 # a path relative to a directory handle is joined onto the handle's own path
-# (FDPATH) first. groups the kernel does not provide yet (threads, the io
-# queue, sockets) return ENOSYS, and std.system.capability does not claim them.
+# (FDPATH) first. thread, socket and readiness operations use the native
+# kernel interfaces below.
 
 use io_error:      std.io.error;
 use cpu_features_: std.system.cpu.features;
@@ -80,6 +80,12 @@ val SYS_ACCEPT:    usize = 76;
 val SYS_ACCEPT4:   usize = 91;
 val SYS_SHUTDOWN:  usize = 77;
 val SYS_GETPEERNAME: usize = 78;
+val SYS_SYMLINK: usize = 93;
+val SYS_FCHMOD: usize = 95;
+val SYS_THREAD_NAME: usize = 97;
+val SYS_AFFINITY: usize = 98;
+val SYS_STACK_BOUNDS: usize = 99;
+val SYS_READDIR_LONG: usize = 100;
 
 # MachOS's own socket options (SETSOCKOPT takes the value itself)
 val MACHOS_SO_RCVTIMEO:  usize = 1;
@@ -92,12 +98,13 @@ val KIND_FILE: u64 = 1;
 val KIND_DIR:  u64 = 2;
 val KIND_DEV:  u64 = 3;
 val KIND_PIPE: u64 = 4;
+val KIND_LINK: u64 = 6;
 
 val SIGKILL: usize = 9;
 val SIGPIPE: usize = 13;
 val SIG_IGN: usize = 1;
 
-val PATH_MAX: usize = 256;
+val PATH_MAX: usize = 512;
 
 # kernel ABI types
 
@@ -125,7 +132,7 @@ rec NativeEntry {
     uid:      u64;
     gid:      u64;
     name_len: u64;
-    name:     [60]u8;
+    name:     [256]u8;
 }
 
 # how SPAWN starts a child
@@ -174,7 +181,7 @@ pub rec DirectoryCursor {
     error:   i64;
     index:   u64;
     entry:   NativeEntry;
-    name:    [61]u8;
+    name:    [256]u8;
 }
 
 fwd DirectoryEntry:      os_shared.DirectoryEntry;
@@ -497,7 +504,7 @@ pub fun write_at(fd: i32, buf: *u8, count: usize, offset: u64) i64 {
 }
 
 pub fun open(dirfd: i32, path: *u8, flags: i32, mode: i32) i64 {
-    var full:   [256]u8;
+    var full:   [512]u8;
     val n:      i64 = resolve(dirfd, path, ?full[0]);
     if (n < 0) { ret n; }
     var native: i32 = flags;
@@ -519,6 +526,7 @@ fun fill_stat(native: *NativeStat, st: *stat_t) {
     if (native.kind == KIND_DIR) { kind = S_IFDIR; }
     or (native.kind == KIND_DEV) { kind = S_IFCHR; }
     or (native.kind == KIND_PIPE) { kind = S_IFIFO; }
+    or (native.kind == KIND_LINK) { kind = S_IFLNK; }
     st.st_dev        = native.dev;
     st.st_ino        = native.ino;
     st.st_nlink      = native.nlink;
@@ -546,13 +554,13 @@ pub fun stat(fd: i32, st: *stat_t) i64 {
     ret 0;
 }
 
-# MachOS has no symbolic links, so every lookup is already nofollow
+# the final entry follows links unless AT_SYMLINK_NOFOLLOW is requested
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64 {
-    var full:   [256]u8;
+    var full:   [512]u8;
     val n:      i64 = resolve(dirfd, path, ?full[0]);
     if (n < 0) { ret n; }
     var native: NativeStat;
-    val r:      i64 = syscall3(SYS_STAT, (?full[0])::usize, n::usize, (?native)::usize);
+    val r:      i64 = syscall4(SYS_STAT, (?full[0])::usize, n::usize, (?native)::usize, flags::u32::usize);
     if (r < 0) { ret r; }
     fill_stat(?native, st);
     ret 0;
@@ -563,28 +571,23 @@ pub fun stat_mode(st: *stat_t) u32 {
 }
 
 pub fun set_mode(fd: i32, mode: i32) i64 {
-    var full: [256]u8;
-    val n:    i64 = syscall3(SYS_FDPATH, fd::isize::usize, (?full[0])::usize, PATH_MAX);
-    if (n < 0) { ret n; }
-    if (n::usize >= PATH_MAX) { ret ENAMETOOLONG; }
-    ret syscall3(SYS_CHMOD, (?full[0])::usize, n::usize, mode::u32::usize);
+    ret syscall2(SYS_FCHMOD, fd::isize::usize, mode::u32::usize);
 }
 
 pub fun set_mode_at(dirfd: i32, name: *u8, mode: i32) i64 {
     if (name == nil) { ret EINVAL; }
-    var full: [256]u8;
+    var full: [512]u8;
     val n:    i64 = resolve(dirfd, name, ?full[0]);
     if (n < 0) { ret n; }
-    ret syscall3(SYS_CHMOD, (?full[0])::usize, n::usize, mode::u32::usize);
+    ret syscall4(SYS_CHMOD, (?full[0])::usize, n::usize, mode::u32::usize, 1);
 }
 
-# open files keep their contents after an unlink, but MachOS has no handle
-# that pins a file without reading it, so no publication capability is claimed
+# metadata handles retain identity through replacement without content access
 pub fun publication_capabilities(fd: i32) i64 {
     var st: stat_t;
     val r:  i64 = stat(fd, ?st);
     if (r < 0) { ret r; }
-    ret 0;
+    ret os_shared.PUBLICATION_READ_RETAIN_REPLACE;
 }
 
 pub fun file_identity(fd: i32, out: *identities.Identity) i64 {
@@ -598,7 +601,11 @@ pub fun file_identity(fd: i32, out: *identities.Identity) i64 {
 
 pub fun retain_identity_at(dirfd: i32, path: *u8, access: identities.Access, out: *identities.Identity) i64 {
     if (dirfd == AT_FDCWD || path == nil || out == nil || access > identities.READ_AUTHORIZED) { ret EINVAL; }
-    ret ENOTSUP;
+    val fd: i64 = open(dirfd, path, 1024 | (access::i32 << 11) | O_NOFOLLOW, 0);
+    if (fd < 0) { ret fd; }
+    val result: i64 = file_identity(fd::i32, out);
+    if (result < 0) { close(fd::i32); ret result; }
+    ret fd;
 }
 
 pub fun identity_at(dirfd: i32, path: *u8, out: *identities.Identity) i64 {
@@ -612,11 +619,11 @@ pub fun identity_at(dirfd: i32, path: *u8, out: *identities.Identity) i64 {
 
 # REMOVE takes a file or an empty directory; AT_REMOVEDIR says which one
 pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64 {
-    var full: [256]u8;
+    var full: [512]u8;
     val n:    i64 = resolve(dirfd, path, ?full[0]);
     if (n < 0) { ret n; }
     var native: NativeStat;
-    val r:      i64 = syscall3(SYS_STAT, (?full[0])::usize, n::usize, (?native)::usize);
+    val r:      i64 = syscall4(SYS_STAT, (?full[0])::usize, n::usize, (?native)::usize, 256);
     if (r < 0) { ret r; }
     if ((flags & AT_REMOVEDIR) != 0 && native.kind != KIND_DIR) { ret ENOTDIR; }
     if ((flags & AT_REMOVEDIR) == 0 && native.kind == KIND_DIR) { ret EISDIR; }
@@ -624,8 +631,8 @@ pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64 {
 }
 
 pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64 {
-    var from: [256]u8;
-    var to:   [256]u8;
+    var from: [512]u8;
+    var to:   [512]u8;
     val fl:   i64 = resolve(olddir, oldpath, ?from[0]);
     if (fl < 0) { ret fl; }
     val tl: i64 = resolve(newdir, newpath, ?to[0]);
@@ -640,11 +647,11 @@ pub fun lock_fd(fd: i32, op: i32) i64 {
 }
 
 pub fun symlink(target: *u8, linkpath: *u8) i64 {
-    ret ENOTSUP;
+    ret syscall4(SYS_SYMLINK, target::usize, str_len(target), linkpath::usize, str_len(linkpath));
 }
 
 pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64 {
-    var full: [256]u8;
+    var full: [512]u8;
     val n:    i64 = resolve(dirfd, path, ?full[0]);
     if (n < 0) { ret n; }
     ret syscall3(SYS_MKDIR, (?full[0])::usize, n::usize, mode::u32::usize);
@@ -672,7 +679,7 @@ pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64 {
     if (cursor == nil || out == nil || cursor.address != cursor::usize || !cursor.active) { ret EINVAL; }
     if (cursor.error < 0)                                                                 { ret cursor.error; }
     if (cursor.ended)                                                                     { ret 0; }
-    val got: i64 = syscall3(SYS_READDIR, cursor.fd::isize::usize, cursor.index, (?cursor.entry)::usize);
+    val got: i64 = syscall3(SYS_READDIR_LONG, cursor.fd::isize::usize, cursor.index, (?cursor.entry)::usize);
     if (got < 0) {
         cursor.error = got;
         ret got;
@@ -683,7 +690,7 @@ pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64 {
     }
     cursor.index = cursor.index + 1;
     var n: usize = cursor.entry.name_len::usize;
-    if (n > 59) { n = 59; }
+    if (n > 255) { n = 255; }
     var i: usize = 0;
     for (i < n) {
         cursor.name[i] = cursor.entry.name[i];
@@ -706,7 +713,7 @@ pub fun directory_close(cursor: *DirectoryCursor) i64 {
 
 # F_OK (0) asks only whether it is there
 pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64 {
-    var full: [256]u8;
+    var full: [512]u8;
     val n:    i64 = resolve(dirfd, path, ?full[0]);
     if (n < 0) { ret n; }
     if (mode == 0) {
@@ -753,7 +760,7 @@ pub fun getenv(name: *u8, buf: *u8, cap: usize) i64 {
 }
 
 pub fun getcwd(buf: *u8, size: usize) i64 {
-    var here: [256]u8;
+    var here: [512]u8;
     val n:    i64 = syscall2(SYS_GETCWD, (?here[0])::usize, PATH_MAX);
     if (n < 0) { ret n; }
     if (n::usize + 1 > size) { ret ERANGE; }
@@ -840,7 +847,9 @@ pub fun wait_pid(pid: i64, status: *os_shared.ProcessStatus, options: i32) os_sh
 
 pub fun terminate_child(pid: i64) i64 {
     if (pid <= 0) { ret EINVAL; }
-    ret syscall2(SYS_KILL, pid::usize, SIGKILL);
+    val result: i64 = syscall2(SYS_KILL, pid::usize, SIGKILL);
+    if (result == ESRCH) { ret ECHILD; }
+    ret result;
 }
 
 pub fun setpgid(pid: i64, pgid: i64) i64 {
@@ -915,7 +924,7 @@ fun spawn_with(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, redirect: bool, 
     how.env     = ?env[0];
     how.env_len = el::u64;
     # MachOS starts a child in its parent's working directory
-    var saved: [256]u8;
+    var saved: [512]u8;
     var sl:    i64 = 0;
     if (cwd != nil) {
         sl = syscall2(SYS_GETCWD, (?saved[0])::usize, PATH_MAX);
@@ -1015,8 +1024,8 @@ pub fun cpu_count() i64 {
     ret info[5]::i64;
 }
 
-pub fun thread_affinity(words: *u64, capacity: usize, out_count: *usize) i64 { ret ENOTSUP; }
-pub fun set_thread_affinity(words: *u64, count: usize) i64 { ret ENOTSUP; }
+pub fun thread_affinity(words: *u64, capacity: usize, out_count: *usize) i64 { ret syscall4(SYS_AFFINITY, 0, words::usize, capacity, out_count::usize); }
+pub fun set_thread_affinity(words: *u64, count: usize) i64 { ret syscall4(SYS_AFFINITY, 1, words::usize, count, 0); }
 
 # entropy
 
@@ -1211,6 +1220,7 @@ pub fun thread_spawn(
     val setup: *i64 = (child_sp + 72)::*i64;
     val run:   *i64 = (child_sp + 80)::*i64;
     for (atomic.load(setup) == 0) { thread_wait(setup, 0); }
+    if (name != nil) { syscall4(SYS_THREAD_NAME, 1, name::usize, str_len(name), tid::usize); }
     @native = 0;
     atomic.store(run, 1);
     thread_wake(run);
@@ -1227,9 +1237,7 @@ pub fun thread_detach(native: usize) i64 { ret 0; }
 pub fun thread_current_id() i64 { ret syscall0(SYS_GETTID); }
 
 pub fun thread_current_name(name: *u8, cap: usize) i64 {
-    if (cap < 1) { ret EINVAL; }
-    name[0] = 0;
-    ret 0;
+    ret syscall4(SYS_THREAD_NAME, 0, name::usize, cap, 0);
 }
 
 # sleep while *addr == expected (spurious wakeups are possible)
@@ -1280,7 +1288,7 @@ pub fun stack_bounds(low: *usize, high: *usize) bool {
         @high = block.stack_high;
         ret true;
     }
-    ret false;
+    ret syscall2(SYS_STACK_BOUNDS, low::usize, high::usize) == 0;
 }
 
 # io queue: MachOS's readiness queue (QUEUE_*), one-shot like epoll with

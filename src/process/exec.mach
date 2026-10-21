@@ -1,5 +1,8 @@
 # process spawning and management
 
+use std.system.capability;
+$if (capability.MACHOS) { use machos: std.system.os.machos; }
+
 use std.allocator.fixed;
 use std.collections.vector;
 use std.collections.vector.Vector;
@@ -34,7 +37,6 @@ use std.io.reader.ReadError;
 
 use std.chrono.duration;
 use tm: std.chrono.time;
-use std.system.capability;
 
 $if (capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_PROCESS) {
     use std.allocator.page;
@@ -485,6 +487,10 @@ pub fun spawn_with_options(pathname: str, argv: **u8, envp: **u8, options: Spawn
         val pid: i64 = darwin.spawn_redirected_in_grouped(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd);
         ret spawned(pid, pid);
     }
+    $or (capability.MACHOS) {
+        val machos_pid: i64 = machos.spawn_redirected_in_grouped(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd);
+        ret spawned(machos_pid, machos_pid);
+    }
     $or ($mach.build.os == $mach.os.windows) {
         var job: isize = 0;
         val pid: i64   = windows.spawn_redirected_in_grouped(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd, ?job);
@@ -653,6 +659,7 @@ pub fun terminate_group(child: Child) err[Error] {
     $or ($mach.build.os == $mach.os.windows) {
         ret terminated(windows.terminate_group(child.pgid), child);
     }
+    $or (capability.MACHOS) { ret terminated(machos.terminate_group(child.pgid), child); }
     $or {
         ret err[Error].err{Error.unsupported{}};
     }
@@ -1359,6 +1366,9 @@ test spawn_grouped__child_leads_its_group {
         $or ($mach.build.os == $mach.os.darwin) {
             if (darwin.getpgid(child.pid) != child.pgid) { bad = 1; }
         }
+        $or (capability.MACHOS) {
+            if (machos.getpgid(child.pid) != child.pgid) { bad = 1; }
+        }
 
         val wr: res[ExitStatus, Error] = wait(child);
         if (sel wr.err) { bad = 1; }
@@ -1476,6 +1486,9 @@ test terminate_group__kills_a_grandchild {
                 }
                 $or ($mach.build.os == $mach.os.darwin) {
                     if (darwin.getpgid(grandchild) < 0) { grandchild_gone = 1; }
+                }
+                $or (capability.MACHOS) {
+                    if (machos.getpgid(grandchild) < 0) { grandchild_gone = 1; }
                 }
             }
             if (shell_reaped == 0 || grandchild_gone == 0) { os.sleep(20000000); }
@@ -2124,6 +2137,7 @@ test wait_within__expired_deadline_reaches_a_grandchild {
             $or ($mach.build.os == $mach.os.darwin) {
                 if (darwin.getpgid(grandchild) < 0) { gone = true; }
             }
+            $or (capability.MACHOS) { if (machos.getpgid(grandchild) < 0) { gone = true; } }
             if (!gone) { os.sleep(2000000); }
             spins = spins + 1;
         }

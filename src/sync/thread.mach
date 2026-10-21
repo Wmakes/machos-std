@@ -50,7 +50,7 @@ pub fun code(e: ThreadError) i64 {
 }
 
 fun native_error(status: i64) ThreadError {
-    if (status == ERROR_UNSUPPORTED) { ret ThreadError.unsupported{}; }
+    if (os.error_kind(status) == io_error.UNSUPPORTED) { ret ThreadError.unsupported{}; }
     ret ThreadError.native{status};
 }
 
