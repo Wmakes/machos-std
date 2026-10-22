@@ -1,58 +1,69 @@
-# Mach Standard Library
+# MachOS Standard Library
 
-The standard library for the Mach programming language.
+The MachOS-support fork of [Briar Systems' Mach standard library](https://github.com/briar-systems/mach-std), maintained for [MachOS](https://github.com/Wmakes/MachOS).
+
+This fork follows std **9.5.0** and is used with Mach compiler **6.10.1**. MachOS-specific development is on `main`.
 
 ## Installation
 
-Add std as a dependency in your project's `mach.toml`:
+Add this fork as a dependency in your project's `mach.toml`. Pin a commit so builds use the same source:
 
 ```toml
 [dep.std]
-git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v6.0.0"
+git = "https://github.com/Wmakes/machos-std.git"
+ref = "commit/9520d0a78ba826c42fc2f9794f03ec8375ae90da"
 ```
 
-Or with the dependency manager:
+Or use the dependency manager:
 
-```bash
-mach dep add . std --git https://github.com/briar-systems/mach-std --ref tag/v6.0.0
+```sh
+mach dep add . std --git https://github.com/Wmakes/machos-std.git --ref commit/9520d0a78ba826c42fc2f9794f03ec8375ae90da
 ```
 
-## Support
+The pinned commit contains the MachOS implementation. Select it with a target such as:
 
-std 9.x requires mach 6. It is tested on linux (x86_64, arm64, riscv64), darwin (x86_64, aarch64) and windows (x86_64). Its OS-free core also builds for freestanding targets.
+```toml
+[target.machos]
+isa = "x86_64"
+os = "freestanding"
+abi = "sysv64"
+of = "elf"
+base = 0x400000
+platform = "machos"
+```
 
-std follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See the [changelog](./CHANGELOG.md).
+Compile on the host with `mach build . -t machos -p release`, then run the resulting executable inside MachOS. MachOS itself and the compiler are separate projects.
 
-## API surface
+## MachOS support
 
-The semantic versioning promise covers the driver and library modules, such as `std.net.async` and `std.net.async.local`. Code that uses only those keeps building across minor and patch releases.
+The MachOS backend provides:
 
-std is designed so that callers can reach past a driver when it does not give them what they need, and doing so is expected. The only thing to know is what the version number covers. The `net.async` backend modules are outside the promise:
+- Program startup, arguments, environment and panic handling.
+- Files, directories, metadata, symlinks and native filesystem capabilities.
+- Memory mapping, clocks, randomness, threads and synchronization.
+- Process spawning, redirected I/O and grouped process supervision.
+- TCP/UDP sockets, readiness queues, asynchronous I/O and DNS resolution.
+- Terminal dimensions and raw input.
 
-- `std.net.async.readiness` (`src/net/async/readiness.mach`)
-- `std.net.async.unix` (`src/net/async/unix.mach`)
-- `std.net.async.linux` (`src/net/async/linux.mach`)
-- `std.net.async.darwin` (`src/net/async/darwin.mach`)
-- `std.net.async.windows` (`src/net/async/windows.mach`)
-- `std.net.async.iocp` (`src/net/async/iocp.mach`)
-- `std.net.async.iocp.port` (`src/net/async/iocp/port.mach`)
-- `std.net.async.local.unix` (`src/net/async/local/unix.mach`)
-- `std.net.async.local.windows` (`src/net/async/local/windows.mach`)
+DNS configuration comes from `/proc/net/resolv.conf`, populated by MachOS networking. Runtime behavior and native filesystem guarantees depend on the MachOS kernel and mounted filesystem.
 
-Their signatures may change in a minor release. If you call one directly, check the CHANGELOG when you upgrade.
+The inherited Linux, macOS and Windows implementations remain in the tree. The MachOS port is selected by `os = "freestanding"` and `platform = "machos"`.
 
-The reason: each backend is compiled for its own target only, so exactly one backend exists in any build, and the driver above it owns the portable contract. This list is exactly what was ruled on and says nothing about other modules.
+## API and documentation
 
-std 5.3.0 is the release that raised the question: #793 changed the backend `cancel` signatures and shipped as a minor release, with the change named in its own CHANGELOG entry. The owner then approved this rule.
+The package version follows upstream std. MachOS fork commits are pinned separately; the upstream changelog describes upstream releases.
 
-## Documentation
+Public driver and library modules provide the application-facing API. Native OS and networking backend modules, including `std.system.os.machos` and `std.net.async.machos`, are implementation interfaces and may change alongside the MachOS kernel.
 
-- API documentation lives in the module doc comments under [src](./src). Run `mach doc` to render it.
-- [CHANGELOG.md](./CHANGELOG.md): release changes.
-- [MIGRATION.md](./MIGRATION.md): upgrading across major versions.
-- [OS-CONTRACT.md](./OS-CONTRACT.md): the `std.system.os` primitive contract.
+- Module documentation: [src](./src); render it with `mach doc`.
+- [CHANGELOG.md](./CHANGELOG.md): upstream release history.
+- [MIGRATION.md](./MIGRATION.md): upstream major-version migration guidance.
+- [OS-CONTRACT.md](./OS-CONTRACT.md): native OS primitive contracts.
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md).
+Open MachOS-specific issues and pull requests against `main` in this repository. For general std contributions, see the [upstream project](https://github.com/briar-systems/mach-std) and its contribution guidelines. The inherited [CONTRIBUTING.md](./CONTRIBUTING.md) describes upstream conventions; this fork uses `main` for MachOS work.
+
+## Licence
+
+This fork remains under the [MIT licence](./LICENSE). Briar Systems' original copyright notice is retained, with an additional notice for Wmakes's MachOS contributions.
