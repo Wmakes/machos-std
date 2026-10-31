@@ -969,6 +969,16 @@ pub fun getpid() i64 {
     ret syscall0(SYS_GETPID);
 }
 
+# install a process signal action, returning the previous handler
+pub fun signal_action(signal: usize, handler: usize, restorer: usize, mask: usize) i64 {
+    ret syscall4(SYS_SIGACTION, signal, handler, restorer, mask);
+}
+
+# send a signal to this process
+pub fun signal_raise(signal: usize) i64 {
+    ret syscall2(SYS_KILL, getpid()::usize, signal);
+}
+
 # MachOS gives every process 256 handles
 val HANDLES: u64 = 256;
 

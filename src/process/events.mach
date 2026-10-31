@@ -10,6 +10,7 @@ use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
+use std.types.size.isize;
 use std.types.size.usize;
 
 $if (capability.HAS_IO_QUEUE && capability.HAS_PROCESS) {
@@ -25,6 +26,9 @@ $if (capability.HAS_IO_QUEUE && capability.HAS_PROCESS) {
     $or ($mach.build.os == $mach.os.darwin) {
         use native_os: std.system.os.darwin;
         use std.system.os.darwin.libsystem;
+    }
+    $or ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+        use native_os: std.system.os.machos;
     }
     $or ($mach.build.os == $mach.os.windows) {
         use std.system.os.windows;
@@ -157,6 +161,17 @@ $if ($mach.build.os == $mach.os.linux && $mach.build.arch == $mach.arch.x86_64) 
     }
 }
 
+$if ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+    #[naked]
+    #[symbol("_std_process_machos_sigreturn")]
+    fun machos_sigreturn() {
+        asm x86_64 {
+            mov rax, 41
+            syscall
+        }
+    }
+}
+
 fun native_install() i64 {
     $if ($mach.build.os == $mach.os.linux) {
         var syscall_number: usize = 134;
@@ -222,6 +237,29 @@ fun native_install() i64 {
         }
         ret 0;
     }
+    $or ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+        var signals: [3]usize;
+        signals[0] = 15;
+        signals[1] = 2;
+        signals[2] = 1;
+        val mask:      usize = (1 << 15) | (1 << 2) | (1 << 1);
+        var installed: usize = 0;
+        var i:         usize = 0;
+        for (i < 3) {
+            val previous: i64 = native_os.signal_action(signals[i], native_event::usize, machos_sigreturn::usize, mask);
+            if (previous < 0) {
+                for (installed > 0) {
+                    installed = installed - 1;
+                    native_os.signal_action(signals[installed], global_native[installed], 0, 0);
+                }
+                ret previous;
+            }
+            global_native[i] = previous::usize;
+            installed        = installed + 1;
+            i                = i + 1;
+        }
+        ret 0;
+    }
     $or {
         if (SetConsoleCtrlHandler(native_event::usize, 1) == 0) { ret windows.last_error(); }
         ret 0;
@@ -258,6 +296,20 @@ fun native_restore() i64 {
         }
         ret result;
     }
+    $or ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+        var signals: [3]usize;
+        signals[0] = 15;
+        signals[1] = 2;
+        signals[2] = 1;
+        var result: i64   = 0;
+        var i:      usize = 3;
+        for (i > 0) {
+            i = i - 1;
+            val restored: i64 = native_os.signal_action(signals[i], global_native[i], 0, 0);
+            if (restored < 0 && result == 0) { result = restored; }
+        }
+        ret result;
+    }
     $or {
         if (SetConsoleCtrlHandler(native_event::usize, 0) == 0) { ret windows.last_error(); }
         ret 0;
@@ -274,6 +326,9 @@ fun native_raise(code: i32) i64 {
     $or ($mach.build.os == $mach.os.darwin) {
         if (libsystem.raise(code) != 0) { ret libsystem.fail_errno(); }
         ret 0;
+    }
+    $or ($mach.build.os == $mach.os.freestanding && $mach.build.platform == "machos") {
+        ret native_os.signal_raise(code::isize::usize);
     }
     $or {
         ret native_event(code)::i64 - 1;
